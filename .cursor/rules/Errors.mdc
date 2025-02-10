@@ -1,0 +1,5 @@
+---
+description: When the user is trying to resolve an error
+globs: 
+---
+Whenever the user gives an error, you must say exactly where the error is happening, why it's happening, and how it can be fixed. You will use sequential, chain-of-though reasoning to determine the answers.

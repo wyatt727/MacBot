@@ -64,44 +64,44 @@ my_agent_project/
 
 1. **Clone the Repository:**
 
-   ''''bash
+   ```bash
    git clone <repository_url>
    cd my_agent_project
-   ''''
+   ```
 
 2. **Install Dependencies:**
 
    Ensure you have Python 3.9 or later installed, then run:
 
-   ''''bash
+   ```bash
    pip install -r requirements.txt
-   ''''
+   ```
 
 3. **Prepare the System Prompt:**
 
    Create a file named `system-prompt.txt` in the project root with your system instructions (without examples). For example:
 
-   ''''text
+   ```text
    You are a MacOS command line AI agent. Provide code blocks exactly in the following format:
-   - For shell commands: ''''sh
-   - For Python scripts: ''''python
+   - For shell commands: ```sh
+   - For Python scripts: ```python
    Do not include any extraneous text outside of these code blocks.
-   ''''
+   ```
 
 ## Usage
 
 To run the agent locally:
 
-''''bash
+```bash
 python -m agent.main
-''''
+```
 
 When you run the agent, you'll see a prompt like:
 
-''''text
+```text
 Minimal AI Agent for macOS (Local Mode). Type 'exit', 'quit', or '/bye' to quit.
 User:
-''''
+```
 
 - **Entering Prompts:**  
   Type your prompt (e.g., "whoami" or "open google and change the background to red") and press Enter.
@@ -118,9 +118,9 @@ A comprehensive test suite is provided to verify the functionality of each modul
 
 Run the tests with:
 
-''''bash
+```bash
 python -m unittest discover tests
-''''
+```
 
 The tests cover:
 - Database operations (adding, retrieving, and matching exchanges).

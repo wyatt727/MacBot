@@ -1,36 +1,51 @@
 # agent/code_executor.py
 import os
-import subprocess
 import asyncio
-from datetime import datetime
 import logging
-from .config import GENERATED_CODE_DIR
+from datetime import datetime
+import aiofiles
+import re
+from .config import GENERATED_CODE_DIR, SAVE_CODE_BLOCKS
 
 logger = logging.getLogger(__name__)
+
+def extract_code_blocks(response: str) -> list:
+    """
+    Extracts code blocks from the LLM response.
+    Assumes code blocks are enclosed in triple backticks.
+    """
+    code_blocks = re.findall(r'```(.*?)\n(.*?)```', response, re.DOTALL)
+    return [(lang.strip(), code.strip()) for lang, code in code_blocks]
 
 async def execute_code_async(language: str, code: str, timeout: int = 300) -> (int, str):
     """
     Asynchronously execute a code block.
-    Blocking file I/O and subprocess calls are offloaded to threads.
+    Uses aiofiles for file I/O and asyncio.create_subprocess_exec for subprocess management.
     """
-    def save_code():
-        os.makedirs(GENERATED_CODE_DIR, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        ext = ".py" if language == "python" else ".sh"
-        filename = os.path.join(GENERATED_CODE_DIR, f"generated_{timestamp}{ext}")
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(code.strip() + "\n")
-        return filename
-    filepath = await asyncio.to_thread(save_code)
-
-    def run_code():
-        cmd = [os.sys.executable, filepath] if language == "python" else ["sh", filepath]
+    os.makedirs(GENERATED_CODE_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ext = ".py" if language == "python" else ".sh"
+    filename = os.path.join(GENERATED_CODE_DIR, f"generated_{timestamp}{ext}")
+    async with aiofiles.open(filename, "w", encoding="utf-8") as f:
+        await f.write(code.strip() + "\n")
+    
+    if language == "python":
+        cmd = [os.sys.executable, filename]
+    else:
+        cmd = ["sh", filename]
+    
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            output = result.stdout + result.stderr
-            return result.returncode, output.strip()
-        except subprocess.TimeoutExpired:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
             return -1, f"[{language.capitalize()} Error] Execution timed out after {timeout} seconds."
-        except Exception as e:
-            return -1, f"[{language.capitalize()} Error] Exception: {e}"
-    return await asyncio.to_thread(run_code)
+        output = (stdout.decode() + stderr.decode()).strip()
+        return proc.returncode, output
+    except Exception as e:
+        return -1, f"[{language.capitalize()} Error] Exception: {e}"

@@ -1,9 +1,20 @@
 ---
-description:
-globs:
+description: Main / General Rules
+globs: 
 ---
 
-# Your rule content
+# Main Rules:
 
-- You can @ files here
-- You can use markdown but dont have to
+- Reference [Architecture.md](mdc:agent/Architecture.md) everytime the user has a request, in order to see exactly what will need to be changed or added and how it will alter the project structure. These changes should be clearly stated to the user on every response.
+- After the changes are made, the [Architecture.md](mdc:agent/Architecture.md) file needs to automatically be updated so that it is NEVER out of date.
+
+# Project Rules for the MacBot AI Agent
+
+You are a senior software engineer specializing in building scalable, maintainable, and robust Python systems. In this project your focus is on developing a MacBot AI agent that:
+
+- **Runs locally on CPU-only machines.**
+- **Uses a local SQLite database** to persist conversation history—including successful prompt–response exchanges.
+- **Builds minimal, precise LLM prompts** by combining a freshly read, cached system prompt with the current user query.
+- **Executes code blocks asynchronously** and automatically attempts to auto-fix errors by querying the LLM for corrected code.
+
+
