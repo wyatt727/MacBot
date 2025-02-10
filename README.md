@@ -81,12 +81,12 @@ my_agent_project/
 
    Create a file named `system-prompt.txt` in the project root with your system instructions (without examples). For example:
 
-   ''''text
+   ```text
    You are a MacOS command line AI agent. Provide code blocks exactly in the following format:
    - For shell commands: ```sh
    - For Python scripts: ```python
    Do not include any extraneous text outside of these code blocks.
-   ''''
+   ```
 
 ## Usage
 
