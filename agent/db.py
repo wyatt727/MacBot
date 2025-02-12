@@ -31,7 +31,7 @@ class ConversationDB:
 
     def _create_tables(self):
         cur = self.conn.cursor()
-        # Main conversation table.
+        # Create main conversation table.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS conversation (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,7 +40,7 @@ class ConversationDB:
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Table for storing successful exchanges.
+        # Create successful_exchanges table.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS successful_exchanges (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,35 +49,8 @@ class ConversationDB:
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Add composite index on user_prompt and timestamp.
+        # Create composite index on successful_exchanges.
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_prompt_timestamp ON successful_exchanges(user_prompt, timestamp)")
-        # Create FTS virtual table for full‑text search optimization.
-        cur.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS successful_exchanges_fts USING fts5(
-                user_prompt, 
-                assistant_response,
-                content='successful_exchanges',
-                content_rowid='id'
-            )
-        """)
-        # Triggers to keep the FTS table in sync.
-        cur.execute("""
-            CREATE TRIGGER IF NOT EXISTS successful_exchanges_ai AFTER INSERT ON successful_exchanges BEGIN
-                INSERT INTO successful_exchanges_fts(rowid, user_prompt, assistant_response)
-                VALUES (new.id, new.user_prompt, new.assistant_response);
-            END;
-        """)
-        cur.execute("""
-            CREATE TRIGGER IF NOT EXISTS successful_exchanges_ad AFTER DELETE ON successful_exchanges BEGIN
-                DELETE FROM successful_exchanges_fts WHERE rowid = old.id;
-            END;
-        """)
-        cur.execute("""
-            CREATE TRIGGER IF NOT EXISTS successful_exchanges_au AFTER UPDATE ON successful_exchanges BEGIN
-                UPDATE successful_exchanges_fts SET user_prompt = new.user_prompt, assistant_response = new.assistant_response
-                WHERE rowid = old.id;
-            END;
-        """)
         self.conn.commit()
 
     def _initialize_defaults(self):
@@ -106,19 +79,36 @@ class ConversationDB:
         return [{"role": role, "content": content} for role, content in rows]
 
     def add_successful_exchange(self, user_prompt: str, assistant_response: str):
+        """
+        Add a successful exchange to the DB only if an identical pair does not already exist.
+        Returns True if a new exchange was added, False if it was a duplicate.
+        """
         cur = self.conn.cursor()
+        # Check if the exact request-response pair already exists.
         cur.execute("""
-            INSERT INTO successful_exchanges (user_prompt, assistant_response)
-            VALUES (?, ?)
+            SELECT COUNT(*) FROM successful_exchanges
+            WHERE user_prompt = ? AND assistant_response = ?
         """, (user_prompt, assistant_response))
-        self.conn.commit()
+        count = cur.fetchone()[0]
+        if count == 0:
+            cur.execute("""
+                INSERT INTO successful_exchanges (user_prompt, assistant_response)
+                VALUES (?, ?)
+            """, (user_prompt, assistant_response))
+            self.conn.commit()
+            logger.info("New successful exchange added to the DB.")
+            return True  # New exchange was added
+        else:
+            logger.info("Duplicate exchange found; not adding to the DB.")
+            return False  # Duplicate exchange, not added
 
     def find_successful_exchange(self, user_prompt: str, threshold: float = 0.80, bypass_threshold: float = 0.95):
         """
         Look for a successful exchange whose user prompt is similar to the provided user_prompt.
         Uses difflib.SequenceMatcher for string similarity.
-        Returns a tuple (stored_prompt, assistant_response, similarity) if a match above threshold is found;
-        Otherwise, returns (None, None, best_similarity).
+        Returns:
+            - If a match above threshold is found: (stored_prompt, assistant_response, similarity).
+            - Otherwise: (None, None, best_similarity).
         """
         cur = self.conn.cursor()
         cur.execute("SELECT user_prompt, assistant_response FROM successful_exchanges")
@@ -139,14 +129,14 @@ class ConversationDB:
     def list_successful_exchanges(self, search_term: str = ""):
         cur = self.conn.cursor()
         if search_term:
-            # Use FTS MATCH for faster text-based searches.
+            # Use a LIKE query for simple text-based search.
+            search_term = f"%{search_term}%"
             cur.execute("""
-                SELECT se.id, se.user_prompt, se.assistant_response, se.timestamp
-                FROM successful_exchanges se
-                JOIN successful_exchanges_fts fts ON se.id = fts.rowid
-                WHERE fts MATCH ?
-                ORDER BY se.timestamp DESC
-            """, (search_term,))
+                SELECT id, user_prompt, assistant_response, timestamp
+                FROM successful_exchanges
+                WHERE user_prompt LIKE ? OR assistant_response LIKE ?
+                ORDER BY timestamp DESC
+            """, (search_term, search_term))
         else:
             cur.execute("""
                 SELECT id, user_prompt, assistant_response, timestamp

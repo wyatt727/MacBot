@@ -26,9 +26,9 @@ class TestMinimalAIAgent(unittest.IsolatedAsyncioTestCase):
         # Add a successful exchange manually.
         self.agent.db.add_successful_exchange("whoami", "```sh\nwhoami\n```")
         # Check if querying for a similar prompt returns a successful exchange.
-        response, similarity = self.agent.db.find_successful_exchange("whoami", threshold=0.8, bypass_threshold=0.95)
-        self.assertEqual(response, "```sh\nwhoami\n```")
-        self.assertGreaterEqual(similarity, 0.8)
+        best_prompt, best_response, best_ratio = self.agent.db.find_successful_exchange("whoami", threshold=0.8, bypass_threshold=0.95)
+        self.assertEqual(best_response, "```sh\nwhoami\n```")
+        self.assertGreaterEqual(best_ratio, 0.8)
 
 if __name__ == "__main__":
     unittest.main()

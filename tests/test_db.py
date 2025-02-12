@@ -26,5 +26,17 @@ class TestConversationDB(unittest.TestCase):
         self.assertIsNotNone(response)
         self.assertGreaterEqual(similarity, 0.8)
 
+    def test_successful_exchange_search(self):
+        self.db.add_successful_exchange("whoami", "```sh\nwhoami\n```")
+        # Test searching for the exact prompt
+        exchanges = self.db.list_successful_exchanges("whoami")
+        self.assertGreater(len(exchanges), 0)
+        self.assertEqual(exchanges[0]["user_prompt"], "whoami")
+        
+        # Test searching for a partial match
+        exchanges = self.db.list_successful_exchanges("who")
+        self.assertGreater(len(exchanges), 0)
+        self.assertIn("whoami", [ex["user_prompt"] for ex in exchanges])
+
 if __name__ == "__main__":
     unittest.main()

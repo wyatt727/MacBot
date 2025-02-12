@@ -3,6 +3,7 @@ import aiohttp
 import asyncio
 import logging
 import json
+import os
 from .config import LLM_API_URL
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,35 @@ async def get_llm_response_async(context: list, model: str, session: aiohttp.Cli
     if cache_key in _llm_cache:
         return _llm_cache[cache_key]
     
+    # Check if the Gemini/Gemeni model should be used.
+    if "gemini" in model.lower() or "gemeni" in model.lower():
+        import google.generativeai as genai
+        # Configure the Gemini API client if not already configured.
+        if not getattr(genai, "_configured", False):
+            api_key = os.environ.get("GEMINI_API_KEY", "AIzaSyBu9jVnohiX0G5-pb-iUXYWmFs_q6db5mo")
+            genai.configure(api_key=api_key)
+            setattr(genai, "_configured", True)
+        
+        loop = asyncio.get_event_loop()
+        def call_gemini():
+            try:
+                response = genai.chat(
+                    messages=context,
+                    model=model,
+                    temperature=0.2,
+                )
+                if response and "candidates" in response and len(response["candidates"]) > 0:
+                    return response["candidates"][0]["content"].strip()
+                return ""
+            except Exception as e:
+                logger.error(f"Gemini API call failed: {e}")
+                return f"[Error] Gemini API call failed: {e}"
+                
+        text = await loop.run_in_executor(None, call_gemini)
+        _llm_cache[cache_key] = text
+        return text
+
+    # Non-Gemini branch: use the configured LLM API endpoint.
     payload = {
         "model": model,
         "messages": context,
@@ -32,7 +62,6 @@ async def get_llm_response_async(context: list, model: str, session: aiohttp.Cli
             async with session.post(LLM_API_URL, json=payload, timeout=300) as resp:
                 resp.raise_for_status()
                 if stream:
-                    # Process streaming response.
                     chunks = []
                     async for chunk in resp.content.iter_any():
                         chunks.append(chunk.decode())

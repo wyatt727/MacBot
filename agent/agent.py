@@ -43,6 +43,10 @@ class MinimalAIAgent:
         """
         sys_prompt = await get_system_prompt()
         context = [{"role": "system", "content": sys_prompt}]
+        
+        print("Building context for the LLM...")
+        print(f"System Prompt: {sys_prompt}")
+
         if best_prompt is not None and best_ratio >= 0.80:
             example_text = (
                 "EXAMPLE INTERACTION:\n"
@@ -52,6 +56,10 @@ class MinimalAIAgent:
                 f"{best_response}"
             )
             context.append({"role": "system", "content": example_text})
+            print("Appending example interaction to context:")
+            print(f"User: {best_prompt}")
+            print(f"MacBot: {best_response}")
+
         context.append({"role": "user", "content": self.last_user_query})
         return context
 
@@ -141,13 +149,12 @@ class MinimalAIAgent:
                     print(f"\n[Using Cached Successful Response (similarity {best_ratio:.2f}, bypassing LLM text generation)]")
                     print(f"Cached Response:\n{best_response}\n")
                     response_to_use = best_response
+                    
                     # Only append if it's not a 100% match.
                     if best_ratio < 1.0:
-                        print("[Success DB] Appending new successful exchange!")
-                        #print(f"User Query: {user_input}")
-                        #print(f"Assistant Response:\n{response_to_use}\n")
-                        self.db.add_successful_exchange(user_input, response_to_use)
-                        appended_success = True
+                        if self.db.add_successful_exchange(user_input, response_to_use):
+                            print("[Success DB] Appending new successful exchange!")
+                            appended_success = True
                 else:
                     # Otherwise, build context and query the LLM.
                     context = await self.build_context(best_prompt, best_response, best_ratio)
@@ -167,14 +174,11 @@ class MinimalAIAgent:
                         print(f"\n--- Code Block #{idx} Execution Result ---\n{output}\n")
                         self.db.add_message("result", f"Final Output:\n{output}")
                         # Only add to the success DB if at least one code block executed successfully
-                        # and if there is not already a perfect (100%) match.
                         if ret == 0 and not appended_success:
                             if best_prompt is None or best_ratio < 1.0:
-                                print("[Success DB] Appending new successful exchange:")
-                                print(f"User Query: {user_input}")
-                                print(f"Assistant Response:\n{response_to_use}\n")
-                                self.db.add_successful_exchange(user_input, response_to_use)
-                                appended_success = True
+                                if self.db.add_successful_exchange(user_input, response_to_use):
+                                    print("[Success DB] Appending new successful exchange!")
+                                    appended_success = True
                 else:
                     print("[No executable code blocks found in the response.]")
                 self.db.add_message("user", user_input)
