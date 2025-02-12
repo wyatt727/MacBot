@@ -2,6 +2,10 @@
 description: This rule is helpful for understanding how the program works.
 globs: 
 ---
+---
+description: This rule is helpful for understanding how the program works.
+globs: 
+---
 # Architecture Overview
 
 This document provides an in-depth explanation of every file in the project, detailing its purpose, key features, and how it fits into the overall architecture of the AI agent.
@@ -103,18 +107,16 @@ my_agent_project/
   Implements an asynchronous client to interact with the LLM API.
 - **Key Features:**  
   - **Asynchronous API Requests:**  
-    Utilizes `aiohttp` to send non-blocking HTTP POST requests.
-  - **Payload Construction:**  
-    Constructs a JSON payload including the model, conversation messages (or context), and an optional streaming flag.
-  - **Caching Mechanism:**  
-    Uses an in-memory cache to prevent redundant API calls for identical model and prompt combinations.
-  - **Gemini/Gemeni Branch:**  
-    Checks if the model indicates a Gemini/Gemeni variant.  
-    If so, configures the Google Generative AI client (`google.generativeai`), and uses its `chat()` function to provide a proper chat-format interaction, passing a list of messages.
-    Wraps the synchronous Gemini API call in `asyncio.run_in_executor` to keep the event loop responsive.
+    Utilizes `aiohttp` for non‑blocking HTTP POST requests.
+  - **Payload Construction and Caching:**  
+    Constructs a JSON payload with model, messages, and streaming flag, using in-memory caching to prevent redundant calls.
+  - **Gemini/Gemeni Branch Improvements:**  
+    - **Dedicated Helper Function:** A new helper function (`_call_gemini_sync`) encapsulates the synchronous call.
+    - **Correct API Usage:** Now, the code imports `ChatCompletion` from `google.generativeai` and uses `ChatCompletion.create` with the provided context and parameters.
+    - **Modern Asynchronous Patterns:** Uses `await asyncio.to_thread()` to offload the synchronous call, ensuring the event loop remains responsive.
+    - **Enhanced Error Handling:** Logs detailed errors, including when candidate responses are missing.
   - **Fallback for Non‑Gemini Models:**  
-    Defaults to making asynchronous HTTP POST calls to the specified LLM API endpoint.
-    Implements a retry mechanism with exponential backoff to handle network errors.
+    Implements a retry mechanism with exponential backoff for calls to the default LLM API endpoint.
 
 ---
 
@@ -156,11 +158,11 @@ my_agent_project/
   Contains a suite of tests covering multiple modules of the project, ensuring robust functionality.
 - **Key Features in `tests/test_llm_client.py`:**  
   - **Dummy LLM Server:**  
-    Uses `aiohttp`’s web server to simulate responses from the LLM API, enabling controlled testing scenarios.
+    Uses `aiohttp`'s web server to simulate responses from the LLM API, enabling controlled testing scenarios.
   - **Asynchronous Testing:**  
     Utilizes `unittest.IsolatedAsyncioTestCase` for testing asynchronous functions and HTTP sessions.
   - **Coverage:**  
-    Verifies that the `get_llm_response_async` function returns expected responses (such as a “dummy response”) based on given conditions.
+    Verifies that the `get_llm_response_async` function returns expected responses (such as a "dummy response") based on given conditions.
 
 Additional tests (e.g., for the database, system prompt caching, code execution, and agent logic) are included in separate test files within this directory.
 

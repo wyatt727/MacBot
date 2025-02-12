@@ -8,7 +8,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".
 LLM_API_URL = "http://127.0.0.1:11434/api/chat"  # Change if needed
 
 # Update the model name to use Gemini 1.5 flash.
-LLM_MODEL = "gemeni-1.5-flash"
+LLM_MODEL = "deepseek-coder-v2"
 
 # Execution parameters
 MAX_FIX_ATTEMPTS = 3
