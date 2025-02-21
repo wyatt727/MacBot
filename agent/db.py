@@ -15,64 +15,65 @@ from functools import lru_cache
 import time
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)  # Set back to INFO level
 
 def preprocess_text(text: str) -> str:
     """Preprocess text for better matching by:
     1. Converting to lowercase
-    2. Extracting and preserving special patterns (commands, paths, URLs)
-    3. Normalizing whitespace
-    4. Handling common variations
+    2. Extracting and preserving special patterns
+    3. Normalizing whitespace and handling variations
     """
-    # Convert to lowercase
-    text = text.lower()
+    # Convert to lowercase and normalize whitespace
+    text = ' '.join(text.lower().split())
+    
+    # Quick check for exact matches before heavy processing
+    normalized = re.sub(r'[^a-z0-9\s]', ' ', text)
+    normalized = ' '.join(normalized.split())
     
     # Store special patterns to preserve
     patterns = {
         'commands': re.findall(r'\b(git|ls|cd|cat|python|pip|npm|yarn|docker|kubectl|whoami|curl|wget)\s+[^\s]+', text),
         'paths': re.findall(r'(?:/[^\s/]+)+/?', text),
-        'urls': re.findall(r'https?://[^\s]+', text),
-        'flags': re.findall(r'-{1,2}[a-zA-Z][^\s]*', text),  # Command flags like --help
-        'vars': re.findall(r'\$[a-zA-Z_][a-zA-Z0-9_]*', text)  # Environment variables
+        'urls': re.findall(r'https?://[^\s]+', text)
     }
     
-    # Remove special characters but preserve word boundaries
-    text = re.sub(r'[^a-z0-9\s]', ' ', text)
-    
-    # Normalize whitespace
-    text = ' '.join(text.split())
-    
-    # Add back preserved patterns with higher weight (repeated for emphasis)
-    for pattern_type, matches in patterns.items():
-        if matches:
-            # Repeat important patterns to give them more weight
-            weight = 3 if pattern_type in ['commands', 'paths'] else 2
-            text = text + ' ' + ' '.join(match * weight for match in matches)
-    
-    # Handle common variations
+    # Handle common variations using a single pass
     variations = {
+        'color': ['colour', 'colors', 'colours'],
+        'circle': ['circles'],
+        'change': ['changes', 'changing', 'modify', 'update'],
+        'draw': ['drawing', 'create', 'make'],
         'username': ['user name', 'user-name'],
         'filename': ['file name', 'file-name'],
-        'pathname': ['path name', 'path-name'],
-        'localhost': ['local host', 'local-host'],
         'directory': ['dir', 'folder'],
-        'delete': ['remove', 'del', 'rm'],
-        'copy': ['cp', 'duplicate'],
-        'move': ['mv', 'rename'],
-        'execute': ['run', 'start'],
-        'display': ['show', 'print', 'output'],
-        'create': ['make', 'new'],
-        'modify': ['change', 'update', 'edit']
+        'delete': ['remove', 'del', 'rm']
     }
     
-    # Add common variations to improve matching
-    for main_term, variants in variations.items():
-        if main_term in text:
-            text = text + ' ' + ' '.join(variants)
-        for variant in variants:
-            if variant in text:
-                text = text + ' ' + main_term + ' ' + ' '.join(v for v in variants if v != variant)
+    # Build variations set efficiently
+    words = set(normalized.split())
+    variations_to_add = set()
     
-    return text
+    for word in words:
+        # Check if word is a key in variations
+        if word in variations:
+            variations_to_add.update(variations[word])
+        # Check if word is a value in any variation list
+        for main_word, variants in variations.items():
+            if word in variants:
+                variations_to_add.add(main_word)
+                variations_to_add.update(v for v in variants if v != word)
+    
+    # Add variations and preserved patterns
+    result_parts = [normalized]
+    if variations_to_add:
+        result_parts.append(' '.join(variations_to_add))
+    for pattern_type, matches in patterns.items():
+        if matches:
+            # Add important patterns with higher weight
+            weight = 3 if pattern_type in ['commands', 'paths'] else 2
+            result_parts.extend([' '.join(matches)] * weight)
+    
+    return ' '.join(result_parts)
 
 def calculate_similarity_score(query: str, stored: str) -> float:
     """Calculate a weighted similarity score using multiple metrics with performance tracking."""
@@ -182,35 +183,27 @@ def calculate_similarity_score(query: str, stored: str) -> float:
     total_score = sequence_sim + token_sim + command_sim + semantic_sim + length_score
     total_time = track_timing('total', start_time)
     
-    # Log detailed performance metrics
-    logger.debug(f"\nPerformance Analysis for similarity calculation:")
-    logger.debug(f"{'Component':<20} | {'Time (ms)':<10} | {'% of Total':<10} | {'Score':<10}")
-    logger.debug("-" * 55)
-    
-    for component, duration in timings.items():
-        if component != 'total':
-            percentage = (duration / total_time) * 100
-            score = {
-                'preprocessing': 0,
-                'sequence_similarity': sequence_sim,
-                'token_overlap': token_sim,
-                'command_matching': command_sim,
-                'semantic_similarity': semantic_sim,
-                'length_ratio': length_score
-            }.get(component, 0)
-            logger.debug(f"{component:<20} | {duration*1000:>9.2f} | {percentage:>9.1f}% | {score:>9.3f}")
-    
-    logger.debug("-" * 55)
-    logger.debug(f"{'Total':<20} | {total_time*1000:>9.2f} | {'100.0':>9}% | {total_score:>9.3f}")
-    
-    # Print summary to console for visibility
-    print(f"\n[Performance] Similarity calculation took {total_time*1000:.2f}ms")
-    print(f"Slowest components:")
-    sorted_times = sorted([(k, v) for k, v in timings.items() if k != 'total'], 
-                         key=lambda x: x[1], reverse=True)
-    for component, duration in sorted_times[:3]:
-        percentage = (duration / total_time) * 100
-        print(f"- {component}: {duration*1000:.2f}ms ({percentage:.1f}% of total time)")
+    # Only log detailed performance metrics at debug level
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"\nPerformance Analysis for similarity calculation:")
+        logger.debug(f"{'Component':<20} | {'Time (ms)':<10} | {'% of Total':<10} | {'Score':<10}")
+        logger.debug("-" * 55)
+        
+        for component, duration in timings.items():
+            if component != 'total':
+                percentage = (duration / total_time) * 100
+                score = {
+                    'preprocessing': 0,
+                    'sequence_similarity': sequence_sim,
+                    'token_overlap': token_sim,
+                    'command_matching': command_sim,
+                    'semantic_similarity': semantic_sim,
+                    'length_ratio': length_score
+                }.get(component, 0)
+                logger.debug(f"{component:<20} | {duration*1000:>9.2f} | {percentage:>9.1f}% | {score:>9.3f}")
+        
+        logger.debug("-" * 55)
+        logger.debug(f"{'Total':<20} | {total_time*1000:>9.2f} | {'100.0':>9}% | {total_score:>9.3f}")
     
     return total_score
 
@@ -377,14 +370,18 @@ class ConversationDB:
             timings[name] = duration
             return duration
 
-        # Database query
+        # Database query - search ALL exchanges, not just recent ones
         query_start = time.perf_counter()
         cur = self.conn.execute(
-            "SELECT user_prompt, assistant_response FROM successful_exchanges WHERE timestamp > ?",
-            (datetime.now() - timedelta(seconds=CACHE_TTL),)
+            "SELECT user_prompt, assistant_response FROM successful_exchanges"
         )
         rows = cur.fetchall()
         track_timing('database_query', query_start)
+        
+        if not rows:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"\n[Performance] No matches found in {track_timing('total', start_time)*1000:.2f}ms")
+            return []
         
         # Calculate similarity scores
         scoring_start = time.perf_counter()
@@ -392,26 +389,27 @@ class ConversationDB:
                   for stored_prompt, stored_response in rows]
         track_timing('similarity_scoring', scoring_start)
         
-        if not matches:
-            print(f"\n[Performance] No matches found in {track_timing('total', start_time)*1000:.2f}ms")
-            return []
-        
         # Sort and filter matches
         sort_start = time.perf_counter()
         sorted_matches = sorted(matches, key=lambda x: x[2], reverse=True)
         best_match = sorted_matches[0]
+        
+        # Get all matches above threshold, up to MAX_SIMILAR_EXAMPLES
         additional_matches = [match for match in sorted_matches[1:] 
                             if match[2] >= threshold][:MAX_SIMILAR_EXAMPLES-1]
         track_timing('sort_and_filter', sort_start)
         
-        # Log performance metrics
-        total_time = track_timing('total', start_time)
-        print(f"\n[Performance] Found {len(matches)} potential matches in {total_time*1000:.2f}ms")
-        print(f"Time breakdown:")
-        for component, duration in timings.items():
-            if component != 'total':
-                percentage = (duration / total_time) * 100
-                print(f"- {component}: {duration*1000:.2f}ms ({percentage:.1f}%)")
+        # Only log performance metrics at debug level
+        if logger.isEnabledFor(logging.DEBUG):
+            total_time = track_timing('total', start_time)
+            logger.debug(f"\n[Performance] Found {len(matches)} potential matches in {total_time*1000:.2f}ms")
+            logger.debug(f"Best match similarity: {best_match[2]:.2%}")
+            logger.debug(f"Additional matches: {len(additional_matches)}")
+            logger.debug(f"Time breakdown:")
+            for component, duration in timings.items():
+                if component != 'total':
+                    percentage = (duration / total_time) * 100
+                    logger.debug(f"- {component}: {duration*1000:.2f}ms ({percentage:.1f}%)")
         
         return [best_match] + additional_matches
 

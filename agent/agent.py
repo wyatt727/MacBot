@@ -19,7 +19,7 @@ from .config import (
 )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 class CommandHistory:
     """Manages command history with persistence and navigation."""
@@ -304,9 +304,16 @@ Tips:
                 similar_exchanges = self.db.find_successful_exchange(message)
                 if similar_exchanges:
                     best_match = similar_exchanges[0]  # (prompt, response, similarity)
-                    if best_match[2] >= 0.95:  # If similarity is 95% or higher
-                        print(f"\n[Cache] Found highly similar match (similarity: {best_match[2]:.2%})")
-                        print(f"Original prompt: {best_match[0]}")
+                    # Check for exact match first
+                    if best_match[0].lower().strip() == message.lower().strip():
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug("\n[Cache] Found exact match")
+                        return best_match[1]
+                    # Otherwise check for high similarity
+                    elif best_match[2] >= 0.93:  # If similarity is 93% or higher
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"\n[Cache] Found highly similar match (similarity: {best_match[2]:.2%})")
+                            logger.debug(f"Original prompt: {best_match[0]}")
                         cached_response = best_match[1]
                         
                         # Extract and execute code blocks immediately
@@ -332,11 +339,14 @@ Tips:
                 # Check if the response contains valid code blocks
                 blocks = self.extract_code_from_response(response)
                 if blocks:
-                    print("\n[DB] Adding successful exchange to database")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug("\n[DB] Adding successful exchange to database")
                     if self.db.add_successful_exchange(message, response):
-                        print("[DB] Successfully added to database")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug("[DB] Successfully added to database")
                     else:
-                        print("[DB] Exchange already exists in database")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug("[DB] Exchange already exists in database")
 
             # Cache the response if appropriate
             if not no_cache and response:
