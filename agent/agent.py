@@ -6,13 +6,17 @@ import subprocess
 import logging
 import readline
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict
 from .db import ConversationDB
 from .system_prompt import get_system_prompt
 from .llm_client import get_llm_response_async
 from .code_executor import execute_code_async
-from .config import LLM_MODEL
+from .config import (
+    LLM_MODEL, MAX_CONCURRENT_LLM_CALLS, 
+    MAX_CONCURRENT_CODE_EXECUTIONS, RESPONSE_TIMEOUT,
+    SIMILARITY_THRESHOLD
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -90,13 +94,19 @@ class MinimalAIAgent:
         self.model = model
         self.db = ConversationDB()
         self.last_user_query = ""
-        self.aiohttp_session = aiohttp.ClientSession()
-        # Semaphores to limit concurrent LLM calls and code executions.
-        self.llm_semaphore = asyncio.Semaphore(5)
-        self.code_semaphore = asyncio.Semaphore(5)
+        self.aiohttp_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=RESPONSE_TIMEOUT)
+        )
+        # Optimized semaphores
+        self.llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
+        self.code_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CODE_EXECUTIONS)
         self.command_history = CommandHistory()
         self.session_start = datetime.now()
         self.in_comparison_mode = False
+        
+        # Response cache
+        self._response_cache = {}
+        self._cache_lock = asyncio.Lock()
         
         # Initialize command aliases and shortcuts
         self.command_aliases = {
@@ -107,7 +117,8 @@ class MinimalAIAgent:
             '/stats': self.show_session_stats,
             '/repeat': self.repeat_last_command,
             '/success': self.process_success_command,
-            '/compare': self.compare_models_command
+            '/compare': self.compare_models_command,
+            '/nocache': lambda x: x  # Pass-through for nocache command
         }
 
     async def show_help(self, _: str):
@@ -190,7 +201,7 @@ Tips:
     async def _build_context(self, user_message: str, no_cache: bool = False) -> List[Dict[str, str]]:
         """
         Build the context for the conversation, including:
-        1. System prompt
+        1. System prompt (with dynamically included similar examples)
         2. Recent conversation history
         3. Similar successful exchanges (if caching is enabled)
         
@@ -203,22 +214,14 @@ Tips:
         """
         context = []
         
-        # 1. Add system prompt
-        system_prompt = await get_system_prompt()
+        # 1. Add system prompt with relevant examples
+        system_prompt = await get_system_prompt(user_message if not no_cache else None)
         context.append({"role": "system", "content": system_prompt})
         
         # 2. Add recent conversation history
         context.extend(self.db.get_recent_messages())
         
-        # 3. Add similar successful exchanges if caching is enabled
-        if not no_cache:
-            similar_exchanges = self.db.find_successful_exchange(user_message)
-            for stored_prompt, stored_response, ratio in similar_exchanges:
-                if ratio >= 0.80:  # Only include high-confidence matches
-                    context.append({"role": "user", "content": stored_prompt})
-                    context.append({"role": "assistant", "content": stored_response})
-        
-        # 4. Add current user message
+        # 3. Add current user message
         context.append({"role": "user", "content": user_message})
         return context
 
@@ -265,40 +268,85 @@ Tips:
         async with self.code_semaphore:
             return await self.process_code_block(language, code)
 
-    async def process_message(self, message: str) -> str:
-        """Process a user message and return the response."""
+    async def _get_cached_response(self, prompt: str) -> Optional[str]:
+        """Get response from cache if available and not expired."""
+        async with self._cache_lock:
+            if prompt in self._response_cache:
+                timestamp, response = self._response_cache[prompt]
+                if datetime.now() - timestamp < timedelta(seconds=CACHE_TTL):
+                    return response
+                del self._response_cache[prompt]
+            return None
+
+    async def _cache_response(self, prompt: str, response: str):
+        """Cache a response with timestamp."""
+        async with self._cache_lock:
+            self._response_cache[prompt] = (datetime.now(), response)
+
+    async def _process_code_blocks_parallel(self, blocks: List[Tuple[str, str]]) -> List[Tuple[int, str]]:
+        """Process code blocks in parallel with optimized concurrency."""
+        if not blocks:
+            return []
+            
+        async def process_block(block: Tuple[str, str]) -> Tuple[int, str]:
+            lang, code = block
+            async with self.code_semaphore:
+                return await self.process_code_block(lang, code)
+        
+        return await asyncio.gather(*(process_block(block) for block in blocks))
+
+    async def process_message(self, message: str, no_cache: bool = False) -> str:
+        """Optimized message processing with caching and parallel execution."""
         try:
-            # Extract command if present
-            command, args = self._extract_command_and_args(message)
-            
-            # Handle special commands
-            if command == "help":
-                return self.help_command()
-            elif command == "list":
-                return self.list_command(args)
-            elif command == "remove":
-                return self.remove_command(args)
-            elif command == "update":
-                return self.update_command(args)
-            elif command == "compare":
-                return await self.compare_models_command(args)
-            
-            # Check for nocache flag
-            no_cache = False
-            if command == "nocache":
-                no_cache = True
-                message = args  # Use the rest as the actual message
-            
-            # Build context and get response
+            # Check for high similarity matches first (if caching is enabled)
+            if not no_cache:
+                # Find similar exchanges
+                similar_exchanges = self.db.find_successful_exchange(message)
+                if similar_exchanges:
+                    best_match = similar_exchanges[0]  # (prompt, response, similarity)
+                    if best_match[2] >= 0.95:  # If similarity is 95% or higher
+                        print(f"\n[Cache] Found highly similar match (similarity: {best_match[2]:.2%})")
+                        print(f"Original prompt: {best_match[0]}")
+                        cached_response = best_match[1]
+                        
+                        # Extract and execute code blocks immediately
+                        blocks = self.extract_code_from_response(cached_response)
+                        if blocks:
+                            results = await self._process_code_blocks_parallel(blocks)
+                            for idx, (ret, output) in enumerate(results, 1):
+                                print(f"\n--- Code Block #{idx} Execution Result ---\n{output}\n")
+                        
+                        return cached_response
+
+            # If no high similarity match or caching disabled, proceed with normal processing
             context = await self._build_context(message, no_cache=no_cache)
-            response = await get_llm_response_async(context, self.model, self.aiohttp_session)
-            
-            # Save successful exchange if caching is enabled
-            if not no_cache and self._is_successful_exchange(response):
-                self.db.add_successful_exchange(message, response)
-            
+            async with self.llm_semaphore:
+                response = await get_llm_response_async(
+                    context, 
+                    self.model, 
+                    self.aiohttp_session
+                )
+
+            # Save successful exchanges if not in comparison mode and caching is enabled
+            if not self.in_comparison_mode and not no_cache:
+                # Check if the response contains valid code blocks
+                blocks = self.extract_code_from_response(response)
+                if blocks:
+                    print("\n[DB] Adding successful exchange to database")
+                    if self.db.add_successful_exchange(message, response):
+                        print("[DB] Successfully added to database")
+                    else:
+                        print("[DB] Exchange already exists in database")
+
+            # Cache the response if appropriate
+            if not no_cache and response:
+                await self._cache_response(message, response)
+
             return response
-            
+
+        except asyncio.TimeoutError:
+            logger.error("LLM request timed out")
+            return "Error: Request timed out. Please try again."
         except Exception as e:
             logger.error(f"Error processing message: {e}")
             return f"Error processing message: {str(e)}"
@@ -397,92 +445,59 @@ Examples:
             print("Please try again or check the logs for more details.")
 
     async def run(self):
-        """Main agent loop with enhanced user interaction."""
+        """Enhanced main loop with optimized processing."""
         print("Minimal AI Agent for macOS (Local Mode).")
         print('Type "/h" or "/help" for available commands.')
         try:
             while True:
                 try:
-                    appended_success = False  # Initialize at the start of each loop
                     user_input = await asyncio.to_thread(input, "User: ")
                     
-                    # Handle special commands
-                    if user_input.strip().startswith('/'):
-                        command = user_input.split()[0].lower()
-                        if command in self.command_aliases:
-                            result = await self.command_aliases[command](user_input)
-                            if isinstance(result, str):  # Handle command substitution
-                                user_input = result
-                            else:
-                                continue
-                    
-                    # Handle exit commands
+                    # Quick exit check
                     if user_input.lower() in ("exit", "quit", "/bye"):
-                        print("Exiting gracefully. Goodbye!")
                         break
-                    
-                    # Add command to history
-                    self.command_history.add_command(user_input)
-                    
-                    # Use the last query if the input is empty
-                    if user_input.strip() == "":
-                        user_input = self.last_user_query
-                    self.last_user_query = user_input
 
-                    # Check for nocache flag
+                    # Handle empty input
+                    if not user_input.strip():
+                        user_input = self.last_user_query
+                        if not user_input:
+                            continue
+
+                    # Process command flags
                     no_cache = False
                     if user_input.startswith('/nocache '):
                         no_cache = True
-                        user_input = user_input[9:].strip()  # Remove '/nocache ' prefix
+                        user_input = user_input[9:].strip()
+                    
+                    # Handle special commands
+                    if user_input.startswith('/'):
+                        command = user_input.split()[0].lower()
+                        if command in self.command_aliases:
+                            result = await self.command_aliases[command](user_input)
+                            if isinstance(result, str):
+                                user_input = result
+                            else:
+                                continue
 
-                    # Retrieve the best matching successful exchange from the DB
-                    similar_examples = self.db.find_successful_exchange(user_input, threshold=0.80)
-                    
-                    # Get the best match if any examples were found
-                    best_match = similar_examples[0] if similar_examples else (None, None, 0)
-                    best_prompt, best_response, best_ratio = best_match
-                    
-                    # If the similarity is extremely high (95-100%) and not in nocache mode, use the cached response
-                    if not no_cache and best_prompt is not None and best_ratio >= 0.95:
-                        print(f"\n[Using Cached Response - Similarity: {best_ratio:.3f}]")
-                        print("Original Query:", best_prompt)
-                        print("Current Query:", user_input)
-                        print(f"Cached Response:\n{best_response}\n")
-                        response_to_use = best_response
-                        
-                        # Only append if it's not a 100% match
-                        if best_ratio < 1.0:
-                            if self.db.add_successful_exchange(user_input, response_to_use):
-                                print("[Success DB] Added new variation of successful exchange")
-                                appended_success = True
-                    else:
-                        # Build context with all matching examples
-                        context = await self._build_context(user_input, no_cache=no_cache)
-                        async with self.llm_semaphore:
-                            response_to_use = await get_llm_response_async(context, self.model, self.aiohttp_session)
-                        print("\n[LLM Response]\n", response_to_use)
-                        self.db.add_message("assistant", response_to_use)
-                    
-                    # Process code blocks concurrently
-                    blocks = self.extract_code_from_response(response_to_use)
+                    # Add to history and update last query
+                    self.command_history.add_command(user_input)
+                    self.last_user_query = user_input
+
+                    # Process message and handle response
+                    response = await self.process_message(user_input, no_cache=no_cache)
+                    print("\n[Response]\n", response)
+
+                    # Extract and process code blocks in parallel
+                    blocks = self.extract_code_from_response(response)
                     if blocks:
-                        tasks = []
-                        for idx, (lang, code) in enumerate(blocks, start=1):
-                            tasks.append(self.process_code_block_with_semaphore(lang, code, idx))
-                        results = await asyncio.gather(*tasks)
-                        for idx, (ret, output) in enumerate(results, start=1):
+                        results = await self._process_code_blocks_parallel(blocks)
+                        for idx, (ret, output) in enumerate(results, 1):
                             print(f"\n--- Code Block #{idx} Execution Result ---\n{output}\n")
-                            self.db.add_message("result", f"Final Output:\n{output}")
-                            # Only add to the success DB if at least one code block executed successfully and not in nocache mode
-                            if ret == 0 and not appended_success and not no_cache:
-                                if best_prompt is None or best_ratio < 1.0:
-                                    if self.db.add_successful_exchange(user_input, response_to_use):
-                                        print("[Success DB] Added new successful exchange")
-                                        appended_success = True
-                    else:
-                        print("[No executable code blocks found in the response.]")
-                    self.db.add_message("user", user_input)
                     
+                    # Update conversation history
+                    self.db.add_message("user", user_input)
+                    self.db.add_message("assistant", response)
+
                 except KeyboardInterrupt:
                     print("\nOperation cancelled. Type 'exit' to quit or continue with a new command.")
                 except Exception as e:
@@ -490,10 +505,15 @@ Examples:
                     print(f"\nError: {e}")
                     print("Type '/h' for help or continue with a new command.")
         finally:
-            self.command_history.save_history()
-            await self.aiohttp_session.close()
-            self.db.close()
-            print("Agent exited. Command history saved.")
+            # Cleanup
+            await self._cleanup()
+
+    async def _cleanup(self):
+        """Clean up resources."""
+        self.command_history.save_history()
+        await self.aiohttp_session.close()
+        self.db.close()
+        print("Agent exited. Command history saved.")
 
 if __name__ == "__main__":
     asyncio.run(MinimalAIAgent(model=LLM_MODEL).run())

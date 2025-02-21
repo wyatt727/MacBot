@@ -11,13 +11,20 @@ LLM_API_URL = "http://127.0.0.1:11434/api/chat"  # Change if needed
 LLM_MODEL = "deepseek-coder-v2"
 
 # Execution parameters
-MAX_FIX_ATTEMPTS = 3
+MAX_FIX_ATTEMPTS = 2
 
 # Number of similar examples to include in context
-MAX_SIMILAR_EXAMPLES = 2
+MAX_SIMILAR_EXAMPLES = 3
 
 # Number of context messages to include
-CONTEXT_MSG_COUNT = 10
+CONTEXT_MSG_COUNT = 5
+
+# Performance Configuration
+SIMILARITY_THRESHOLD = 0.50  # Lower threshold to get more examples
+CACHE_TTL = 3600  # Cache TTL in seconds
+MAX_CONCURRENT_LLM_CALLS = 3  # Limit concurrent LLM API calls
+MAX_CONCURRENT_CODE_EXECUTIONS = 3  # Limit concurrent code executions
+RESPONSE_TIMEOUT = 900  # Timeout for LLM API calls in seconds
 
 # Database configuration
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "conversation.db")

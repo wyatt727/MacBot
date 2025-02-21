@@ -5,8 +5,14 @@ import difflib
 from typing import Tuple, Optional, List, Dict
 import re
 from collections import Counter
-from .config import DB_FILE, CONTEXT_MSG_COUNT, MAX_SIMILAR_EXAMPLES
+from .config import (
+    DB_FILE, CONTEXT_MSG_COUNT, MAX_SIMILAR_EXAMPLES,
+    SIMILARITY_THRESHOLD, CACHE_TTL
+)
 import json
+from datetime import datetime, timedelta
+from functools import lru_cache
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -69,21 +75,28 @@ def preprocess_text(text: str) -> str:
     return text
 
 def calculate_similarity_score(query: str, stored: str) -> float:
-    """Calculate a weighted similarity score using multiple metrics:
-    1. Sequence similarity (25%)
-    2. Token overlap (25%)
-    3. Command pattern matching (20%)
-    4. Semantic similarity (20%)
-    5. Length ratio penalty (10%)
-    """
+    """Calculate a weighted similarity score using multiple metrics with performance tracking."""
+    start_time = time.perf_counter()
+    timings = {}
+
+    def track_timing(name: str, start: float) -> float:
+        duration = time.perf_counter() - start
+        timings[name] = duration
+        return duration
+
     # Preprocess both texts
+    preprocess_start = time.perf_counter()
     query_proc = preprocess_text(query)
     stored_proc = preprocess_text(stored)
+    track_timing('preprocessing', preprocess_start)
     
     # 1. Sequence similarity using difflib (25%)
+    seq_start = time.perf_counter()
     sequence_sim = difflib.SequenceMatcher(None, query_proc, stored_proc).ratio() * 0.25
+    track_timing('sequence_similarity', seq_start)
     
     # 2. Token overlap with position awareness (25%)
+    token_start = time.perf_counter()
     query_tokens = query_proc.split()
     stored_tokens = stored_proc.split()
     
@@ -110,8 +123,10 @@ def calculate_similarity_score(query: str, stored: str) -> float:
                         sum(position_scores) / len(position_scores) * 0.25)
         else:
             token_sim = 0.0
+    track_timing('token_overlap', token_start)
     
     # 3. Command pattern matching (20%)
+    cmd_start = time.perf_counter()
     def extract_commands(text):
         # Extract full commands with arguments
         cmd_pattern = r'\b(git|ls|cd|cat|python|pip|npm|yarn|docker|kubectl|whoami|curl|wget)\s+[^\s]+'
@@ -132,8 +147,10 @@ def calculate_similarity_score(query: str, stored: str) -> float:
         cmd_match = len(query_cmds & stored_cmds) / max(len(query_cmds | stored_cmds), 1) * 0.15
         name_match = len(query_cmd_names & stored_cmd_names) / max(len(query_cmd_names | stored_cmd_names), 1) * 0.05
         command_sim = cmd_match + name_match
+    track_timing('command_matching', cmd_start)
     
     # 4. Semantic similarity using key concept matching (20%)
+    sem_start = time.perf_counter()
     concepts = {
         'file_ops': r'\b(file|read|write|open|close|save|delete|remove|copy|move|rename)\b',
         'system': r'\b(system|os|process|service|daemon|run|execute|kill|stop|start)\b',
@@ -153,22 +170,47 @@ def calculate_similarity_score(query: str, stored: str) -> float:
     
     concept_matches = sum(1 for c in concepts if query_concepts[c] == stored_concepts[c])
     semantic_sim = (concept_matches / len(concepts)) * 0.20
+    track_timing('semantic_similarity', sem_start)
     
     # 5. Length ratio penalty (10%)
+    len_start = time.perf_counter()
     len_ratio = min(len(query_proc), len(stored_proc)) / max(len(query_proc), len(stored_proc))
     length_score = len_ratio * 0.10
+    track_timing('length_ratio', len_start)
     
     # Calculate final score
     total_score = sequence_sim + token_sim + command_sim + semantic_sim + length_score
+    total_time = track_timing('total', start_time)
     
-    # Log detailed scoring for debugging
-    logger.debug(f"Similarity Scores for '{query}' vs '{stored}':")
-    logger.debug(f"  Sequence Similarity: {sequence_sim:.3f}")
-    logger.debug(f"  Token Overlap: {token_sim:.3f}")
-    logger.debug(f"  Command Matching: {command_sim:.3f}")
-    logger.debug(f"  Semantic Similarity: {semantic_sim:.3f}")
-    logger.debug(f"  Length Score: {length_score:.3f}")
-    logger.debug(f"  Total Score: {total_score:.3f}")
+    # Log detailed performance metrics
+    logger.debug(f"\nPerformance Analysis for similarity calculation:")
+    logger.debug(f"{'Component':<20} | {'Time (ms)':<10} | {'% of Total':<10} | {'Score':<10}")
+    logger.debug("-" * 55)
+    
+    for component, duration in timings.items():
+        if component != 'total':
+            percentage = (duration / total_time) * 100
+            score = {
+                'preprocessing': 0,
+                'sequence_similarity': sequence_sim,
+                'token_overlap': token_sim,
+                'command_matching': command_sim,
+                'semantic_similarity': semantic_sim,
+                'length_ratio': length_score
+            }.get(component, 0)
+            logger.debug(f"{component:<20} | {duration*1000:>9.2f} | {percentage:>9.1f}% | {score:>9.3f}")
+    
+    logger.debug("-" * 55)
+    logger.debug(f"{'Total':<20} | {total_time*1000:>9.2f} | {'100.0':>9}% | {total_score:>9.3f}")
+    
+    # Print summary to console for visibility
+    print(f"\n[Performance] Similarity calculation took {total_time*1000:.2f}ms")
+    print(f"Slowest components:")
+    sorted_times = sorted([(k, v) for k, v in timings.items() if k != 'total'], 
+                         key=lambda x: x[1], reverse=True)
+    for component, duration in sorted_times[:3]:
+        percentage = (duration / total_time) * 100
+        print(f"- {component}: {duration*1000:.2f}ms ({percentage:.1f}% of total time)")
     
     return total_score
 
@@ -191,9 +233,41 @@ DEFAULT_CONVERSATION = [
 class ConversationDB:
     def __init__(self, db_file: str = DB_FILE):
         self.db_file = db_file
-        self.conn = sqlite3.connect(self.db_file, check_same_thread=False)
+        self._setup_connection()
         self._create_tables()
         self._initialize_defaults()
+        self._prepare_statements()
+        
+    def _setup_connection(self):
+        """Setup database connection with optimized settings."""
+        self.conn = sqlite3.connect(
+            self.db_file,
+            check_same_thread=False,
+            timeout=30.0,  # Increased timeout
+            isolation_level=None  # Autocommit mode
+        )
+        self.conn.execute("PRAGMA journal_mode=WAL")  # Write-Ahead Logging
+        self.conn.execute("PRAGMA synchronous=NORMAL")  # Faster writes
+        self.conn.execute("PRAGMA cache_size=-2000")  # 2MB cache
+        self.conn.execute("PRAGMA temp_store=MEMORY")  # Store temp tables in memory
+        
+    def _prepare_statements(self):
+        """Pre-compile commonly used SQL statements using cursor objects."""
+        # Create cursors for prepared statements
+        self.prepared_statements = {
+            'add_message': {
+                'cursor': self.conn.cursor(),
+                'sql': "INSERT INTO conversation (role, content) VALUES (?, ?)"
+            },
+            'get_recent': {
+                'cursor': self.conn.cursor(),
+                'sql': "SELECT role, content FROM conversation WHERE role IN ('user','assistant') ORDER BY timestamp DESC LIMIT ?"
+            },
+            'add_exchange': {
+                'cursor': self.conn.cursor(),
+                'sql': "INSERT INTO successful_exchanges (user_prompt, assistant_response) VALUES (?, ?)"
+            }
+        }
 
     def _create_tables(self):
         cur = self.conn.cursor()
@@ -249,112 +323,288 @@ class ConversationDB:
             self.conn.commit()
 
     def add_message(self, role: str, content: str):
-        cur = self.conn.cursor()
-        cur.execute("INSERT INTO conversation (role, content) VALUES (?, ?)", (role, content))
-        self.conn.commit()
+        """Optimized message addition using prepared statement."""
+        try:
+            stmt = self.prepared_statements['add_message']
+            stmt['cursor'].execute(stmt['sql'], (role, content))
+        except sqlite3.Error as e:
+            logger.error(f"Database error adding message: {e}")
+            # Fallback to new cursor if the prepared one fails
+            cursor = self.conn.cursor()
+            cursor.execute("INSERT INTO conversation (role, content) VALUES (?, ?)", (role, content))
 
-    def get_recent_messages(self, limit: int = CONTEXT_MSG_COUNT):
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT role, content FROM conversation   
-            WHERE role IN ('user','assistant')
-            ORDER BY timestamp DESC LIMIT ?
-        """, (limit,))
-        rows = cur.fetchall()[::-1]  # Reverse to chronological order.
-        return [{"role": role, "content": content} for role, content in rows]
+    def get_recent_messages(self, limit: int = CONTEXT_MSG_COUNT) -> List[Dict[str, str]]:
+        """Optimized recent message retrieval using prepared statement."""
+        try:
+            stmt = self.prepared_statements['get_recent']
+            stmt['cursor'].execute(stmt['sql'], (limit,))
+            rows = stmt['cursor'].fetchall()
+            return [{"role": role, "content": content} for role, content in reversed(rows)]
+        except sqlite3.Error as e:
+            logger.error(f"Database error getting recent messages: {e}")
+            return []
 
-    def add_successful_exchange(self, user_prompt: str, assistant_response: str):
-        """
-        Add a successful exchange to the DB only if an identical pair does not already exist.
-        Returns True if a new exchange was added, False if it was a duplicate.
-        """
-        cur = self.conn.cursor()
-        # Check if the exact request-response pair already exists.
-        cur.execute("""
-            SELECT COUNT(*) FROM successful_exchanges
-            WHERE user_prompt = ? AND assistant_response = ?
-        """, (user_prompt, assistant_response))
-        count = cur.fetchone()[0]
-        if count == 0:
-            cur.execute("""
-                INSERT INTO successful_exchanges (user_prompt, assistant_response)
-                VALUES (?, ?)
-            """, (user_prompt, assistant_response))
-            self.conn.commit()
-            logger.info("New successful exchange added to the DB.")
-            return True  # New exchange was added
-        else:
-            logger.info("Duplicate exchange found; not adding to the DB.")
-            return False  # Duplicate exchange, not added
+    def add_successful_exchange(self, user_prompt: str, assistant_response: str) -> bool:
+        """Optimized successful exchange addition with duplicate check."""
+        try:
+            # Check for duplicates using indexed columns
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT EXISTS(SELECT 1 FROM successful_exchanges WHERE user_prompt = ? AND assistant_response = ?)",
+                (user_prompt, assistant_response)
+            )
+            count = cursor.fetchone()[0]
+            
+            if not count:
+                stmt = self.prepared_statements['add_exchange']
+                stmt['cursor'].execute(stmt['sql'], (user_prompt, assistant_response))
+                # Clear the cache when new data is added
+                self.find_successful_exchange.cache_clear()
+                return True
+            return False
+        except sqlite3.Error as e:
+            logger.error(f"Database error adding successful exchange: {e}")
+            return False
 
-    def find_successful_exchange(self, user_prompt: str, threshold: float = 0.80, max_examples: Optional[int] = None) -> List[Tuple[str, str, float]]:
+    @lru_cache(maxsize=1000)
+    def find_successful_exchange(self, user_prompt: str, threshold: float = SIMILARITY_THRESHOLD) -> List[Tuple[str, str, float]]:
+        """Cached version of similarity search that always returns at least the best match."""
+        start_time = time.perf_counter()
+        timings = {}
+
+        def track_timing(name: str, start: float) -> float:
+            duration = time.perf_counter() - start
+            timings[name] = duration
+            return duration
+
+        # Database query
+        query_start = time.perf_counter()
+        cur = self.conn.execute(
+            "SELECT user_prompt, assistant_response FROM successful_exchanges WHERE timestamp > ?",
+            (datetime.now() - timedelta(seconds=CACHE_TTL),)
+        )
+        rows = cur.fetchall()
+        track_timing('database_query', query_start)
+        
+        # Calculate similarity scores
+        scoring_start = time.perf_counter()
+        matches = [(stored_prompt, stored_response, calculate_similarity_score(user_prompt, stored_prompt))
+                  for stored_prompt, stored_response in rows]
+        track_timing('similarity_scoring', scoring_start)
+        
+        if not matches:
+            print(f"\n[Performance] No matches found in {track_timing('total', start_time)*1000:.2f}ms")
+            return []
+        
+        # Sort and filter matches
+        sort_start = time.perf_counter()
+        sorted_matches = sorted(matches, key=lambda x: x[2], reverse=True)
+        best_match = sorted_matches[0]
+        additional_matches = [match for match in sorted_matches[1:] 
+                            if match[2] >= threshold][:MAX_SIMILAR_EXAMPLES-1]
+        track_timing('sort_and_filter', sort_start)
+        
+        # Log performance metrics
+        total_time = track_timing('total', start_time)
+        print(f"\n[Performance] Found {len(matches)} potential matches in {total_time*1000:.2f}ms")
+        print(f"Time breakdown:")
+        for component, duration in timings.items():
+            if component != 'total':
+                percentage = (duration / total_time) * 100
+                print(f"- {component}: {duration*1000:.2f}ms ({percentage:.1f}%)")
+        
+        return [best_match] + additional_matches
+
+    def list_successful_exchanges(self, search_term: str = "", offset: int = 0, limit: int = 100) -> List[Dict]:
         """
-        Look for successful exchanges whose user prompts are semantically similar to the provided user_prompt.
-        Returns the top N most similar examples based on max_examples parameter (defaults to MAX_SIMILAR_EXAMPLES).
+        List successful exchanges with pagination and optimized search.
         
         Args:
-            user_prompt: The user's input prompt to find similar examples for
-            threshold: Minimum similarity score threshold (0.0 to 1.0)
-            max_examples: Maximum number of examples to return. If None, uses MAX_SIMILAR_EXAMPLES from config
-        
-        Returns:
-            List of tuples (stored_prompt, assistant_response, similarity_score)
-            List will contain at most max_examples items, sorted by similarity score descending
-        """
-        if max_examples is None:
-            max_examples = MAX_SIMILAR_EXAMPLES
-        
-        cur = self.conn.cursor()
-        cur.execute("SELECT user_prompt, assistant_response FROM successful_exchanges")
-        rows = cur.fetchall()
-        
-        # Track all matches with their similarity scores
-        matches = []
-        
-        for stored_prompt, stored_response in rows:
-            ratio = calculate_similarity_score(user_prompt, stored_prompt)
-            matches.append((stored_prompt, stored_response, ratio))
-        
-        # Sort by similarity score descending and take top N
-        matches.sort(key=lambda x: x[2], reverse=True)
-        top_matches = matches[:max_examples]
-        
-        # Log the matches found
-        logger.info(f"Top {max_examples} matches for prompt: %s", user_prompt)
-        for i, (prompt, _, ratio) in enumerate(top_matches, 1):
-            logger.info(f"  {i}. Score: {ratio:.3f} - Prompt: {prompt}")
+            search_term: Optional search term to filter results
+            offset: Number of records to skip
+            limit: Maximum number of records to return
             
-        return top_matches
-
-    def list_successful_exchanges(self, search_term: str = ""):
+        Returns:
+            List of exchange dictionaries
+        """
         cur = self.conn.cursor()
-        if search_term:
-            # Use a LIKE query for simple text-based search.
-            search_term = f"%{search_term}%"
-            cur.execute("""
-                SELECT id, user_prompt, assistant_response, timestamp
-                FROM successful_exchanges
-                WHERE user_prompt LIKE ? OR assistant_response LIKE ?
-                ORDER BY timestamp DESC
-            """, (search_term, search_term))
-        else:
-            cur.execute("""
-                SELECT id, user_prompt, assistant_response, timestamp
-                FROM successful_exchanges
-                ORDER BY timestamp DESC
-            """)
-        rows = cur.fetchall()
-        return [{"id": r[0], "user_prompt": r[1], "assistant_response": r[2], "timestamp": r[3]} for r in rows]
+        try:
+            if search_term:
+                # Use LIKE query with index optimization
+                search_pattern = f"%{search_term}%"
+                cur.execute("""
+                    SELECT id, user_prompt, assistant_response, timestamp
+                    FROM successful_exchanges
+                    WHERE user_prompt LIKE ? OR assistant_response LIKE ?
+                    ORDER BY timestamp DESC
+                    LIMIT ? OFFSET ?
+                """, (search_pattern, search_pattern, limit, offset))
+            else:
+                cur.execute("""
+                    SELECT id, user_prompt, assistant_response, timestamp
+                    FROM successful_exchanges
+                    ORDER BY timestamp DESC
+                    LIMIT ? OFFSET ?
+                """, (limit, offset))
+            
+            rows = cur.fetchall()
+            return [{"id": r[0], "user_prompt": r[1], "assistant_response": r[2], "timestamp": r[3]} for r in rows]
+            
+        except sqlite3.Error as e:
+            logger.error(f"Database error in list_successful_exchanges: {e}")
+            return []
 
-    def update_successful_exchange(self, exchange_id: int, new_response: str):
+    def get_total_exchanges_count(self, search_term: str = "") -> int:
+        """
+        Get total count of exchanges, optionally filtered by search term.
+        
+        Args:
+            search_term: Optional search term to filter results
+            
+        Returns:
+            Total number of matching exchanges
+        """
         cur = self.conn.cursor()
-        cur.execute("UPDATE successful_exchanges SET assistant_response = ? WHERE id = ?", (new_response, exchange_id))
-        self.conn.commit()
+        try:
+            if search_term:
+                search_pattern = f"%{search_term}%"
+                cur.execute("""
+                    SELECT COUNT(*)
+                    FROM successful_exchanges
+                    WHERE user_prompt LIKE ? OR assistant_response LIKE ?
+                """, (search_pattern, search_pattern))
+            else:
+                cur.execute("SELECT COUNT(*) FROM successful_exchanges")
+            
+            return cur.fetchone()[0]
+            
+        except sqlite3.Error as e:
+            logger.error(f"Database error in get_total_exchanges_count: {e}")
+            return 0
 
-    def remove_successful_exchange(self, exchange_id: int):
+    def batch_update_exchanges(self, exchange_ids: List[int], new_response: str) -> bool:
+        """
+        Update multiple exchanges with the same response.
+        
+        Args:
+            exchange_ids: List of exchange IDs to update
+            new_response: New response text to set
+            
+        Returns:
+            bool: True if all updates were successful
+        """
         cur = self.conn.cursor()
-        cur.execute("DELETE FROM successful_exchanges WHERE id = ?", (exchange_id,))
-        self.conn.commit()
+        try:
+            # Start a transaction
+            cur.execute("BEGIN TRANSACTION")
+            
+            # Update all exchanges
+            cur.executemany(
+                """
+                UPDATE successful_exchanges 
+                SET assistant_response = ?, timestamp = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                [(new_response, exchange_id) for exchange_id in exchange_ids]
+            )
+            
+            # Commit the transaction
+            cur.execute("COMMIT")
+            
+            # Clear the cache
+            self.find_successful_exchange.cache_clear()
+            
+            logger.info(f"Batch updated {len(exchange_ids)} exchanges")
+            return True
+            
+        except sqlite3.Error as e:
+            # Rollback on error
+            cur.execute("ROLLBACK")
+            logger.error(f"Database error in batch_update_exchanges: {e}")
+            return False
+
+    def remove_successful_exchange(self, exchange_id: int) -> bool:
+        """
+        Remove a single exchange by ID.
+        
+        Args:
+            exchange_id: ID of the exchange to remove
+            
+        Returns:
+            bool: True if deletion was successful
+        """
+        cur = self.conn.cursor()
+        try:
+            # Start a transaction
+            cur.execute("BEGIN TRANSACTION")
+            
+            # Verify the exchange exists
+            cur.execute("SELECT EXISTS(SELECT 1 FROM successful_exchanges WHERE id = ?)", (exchange_id,))
+            if not cur.fetchone()[0]:
+                logger.error(f"Exchange ID {exchange_id} not found")
+                return False
+            
+            # Delete the exchange
+            cur.execute("DELETE FROM successful_exchanges WHERE id = ?", (exchange_id,))
+            
+            # Commit the transaction
+            cur.execute("COMMIT")
+            
+            # Clear the cache
+            self.find_successful_exchange.cache_clear()
+            
+            logger.info(f"Successfully deleted exchange {exchange_id}")
+            return True
+            
+        except sqlite3.Error as e:
+            # Rollback on error
+            cur.execute("ROLLBACK")
+            logger.error(f"Database error removing exchange {exchange_id}: {e}")
+            return False
+
+    def batch_delete_exchanges(self, exchange_ids: List[int]) -> Tuple[bool, List[int]]:
+        """
+        Delete multiple exchanges at once.
+        
+        Args:
+            exchange_ids: List of exchange IDs to delete
+            
+        Returns:
+            Tuple[bool, List[int]]: (overall success, list of successfully deleted IDs)
+        """
+        cur = self.conn.cursor()
+        successful_deletes = []
+        
+        try:
+            # Start a transaction
+            cur.execute("BEGIN TRANSACTION")
+            
+            # Delete exchanges one by one to track success
+            for exchange_id in exchange_ids:
+                try:
+                    cur.execute("DELETE FROM successful_exchanges WHERE id = ?", (exchange_id,))
+                    if cur.rowcount > 0:
+                        successful_deletes.append(exchange_id)
+                except sqlite3.Error as e:
+                    logger.error(f"Error deleting exchange {exchange_id}: {e}")
+            
+            # Commit the transaction if any deletions were successful
+            if successful_deletes:
+                cur.execute("COMMIT")
+                # Clear the cache
+                self.find_successful_exchange.cache_clear()
+                logger.info(f"Successfully deleted {len(successful_deletes)} exchanges")
+            else:
+                cur.execute("ROLLBACK")
+                logger.warning("No exchanges were deleted")
+            
+            return bool(successful_deletes), successful_deletes
+            
+        except sqlite3.Error as e:
+            # Rollback on error
+            cur.execute("ROLLBACK")
+            logger.error(f"Database error in batch_delete_exchanges: {e}")
+            return False, []
 
     def add_comparison_result(self, prompt: str, result: dict):
         """
@@ -460,5 +710,114 @@ class ConversationDB:
             logger.error(f"Failed to retrieve comparison results: {e}")
             return []
 
+    def cleanup_malformed_responses(self):
+        """Clean up malformed responses in the database by removing any text outside of code blocks."""
+        cur = self.conn.cursor()
+        try:
+            # Start a transaction
+            cur.execute("BEGIN TRANSACTION")
+            
+            # Get all responses
+            cur.execute("SELECT id, assistant_response FROM successful_exchanges")
+            rows = cur.fetchall()
+            
+            # Pattern to match complete code blocks
+            code_block_pattern = r"```[a-z]*\n[\s\S]*?```"
+            
+            updates = []
+            for row_id, response in rows:
+                # Find all code blocks
+                code_blocks = re.findall(code_block_pattern, response)
+                if code_blocks:
+                    # Join multiple code blocks with newlines if there are any
+                    cleaned_response = "\n".join(code_blocks)
+                    if cleaned_response != response:
+                        updates.append((cleaned_response, row_id))
+            
+            if updates:
+                # Perform the updates
+                cur.executemany(
+                    "UPDATE successful_exchanges SET assistant_response = ? WHERE id = ?",
+                    updates
+                )
+                logger.info(f"Cleaned up {len(updates)} malformed responses")
+                
+                # Clear the cache since we modified entries
+                self.find_successful_exchange.cache_clear()
+                
+            # Commit the transaction
+            cur.execute("COMMIT")
+            return len(updates)
+            
+        except sqlite3.Error as e:
+            # Rollback on error
+            cur.execute("ROLLBACK")
+            logger.error(f"Database error cleaning up responses: {e}")
+            return 0
+
     def close(self):
-        self.conn.close()
+        """Properly close all cursors and the connection."""
+        try:
+            # Close all prepared statement cursors
+            for stmt in self.prepared_statements.values():
+                try:
+                    stmt['cursor'].close()
+                except Exception as e:
+                    logger.warning(f"Error closing prepared statement cursor: {e}")
+            
+            # Close the main connection
+            self.conn.close()
+        except Exception as e:
+            logger.error(f"Error during database cleanup: {e}")
+
+    def update_successful_exchange(self, exchange_id: int, new_response: str, new_prompt: str = None) -> bool:
+        """
+        Update a successful exchange with new response and optionally new prompt.
+        
+        Args:
+            exchange_id: ID of the exchange to update
+            new_response: New response text
+            new_prompt: Optional new prompt text
+            
+        Returns:
+            bool: True if update was successful
+        """
+        cur = self.conn.cursor()
+        try:
+            # Start a transaction
+            cur.execute("BEGIN TRANSACTION")
+            
+            # Verify the exchange exists
+            cur.execute("SELECT EXISTS(SELECT 1 FROM successful_exchanges WHERE id = ?)", (exchange_id,))
+            if not cur.fetchone()[0]:
+                logger.error(f"Exchange ID {exchange_id} not found")
+                return False
+            
+            # Update the exchange
+            if new_prompt is not None:
+                cur.execute("""
+                    UPDATE successful_exchanges 
+                    SET assistant_response = ?, user_prompt = ?, timestamp = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (new_response, new_prompt, exchange_id))
+            else:
+                cur.execute("""
+                    UPDATE successful_exchanges 
+                    SET assistant_response = ?, timestamp = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (new_response, exchange_id))
+            
+            # Commit the transaction
+            cur.execute("COMMIT")
+            
+            # Clear the cache since we modified an entry
+            self.find_successful_exchange.cache_clear()
+            
+            logger.info(f"Successfully updated exchange {exchange_id}")
+            return True
+            
+        except sqlite3.Error as e:
+            # Rollback on error
+            cur.execute("ROLLBACK")
+            logger.error(f"Database error updating exchange {exchange_id}: {e}")
+            return False

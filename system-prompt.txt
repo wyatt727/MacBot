@@ -5,9 +5,3 @@ For Python code, you may use any external libraries such as playwright
 Ensure the code is complete and executable without any example paths for files.
 NEVER ADD ADDITIONAL DIALOGUE OUTSIDE OF THE CODE.
 
-EXAMPLE INTERACTION:
-User: whoami
-MacBot:```sh
-whoami
-```
-
