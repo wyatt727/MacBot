@@ -17,6 +17,7 @@ MacBot/
 │   ├── db.py             # SQLite database interface for conversation history and caching successful exchanges
 │   ├── code_executor.py  # Asynchronous code extraction and execution routines with auto‑fix capabilities
 │   ├── llm_client.py     # Asynchronous LLM API client for fetching responses
+│   ├── model_comparator.py # Model comparison and analysis functionality
 │   ├── agent.py          # Core agent logic: conversation management, LLM invocation, caching, and code execution
 │   └── main.py           # Entry point for launching the AI agent
 ├── tests/                # Unit and integration tests
@@ -52,10 +53,15 @@ MacBot/
 
 ### 3. `agent/db.py`
 - **Purpose:**  
-  Provides persistent storage for both full conversation history and successful prompt–response pairs using SQLite.
+  Provides persistent storage for conversations, successful exchanges, and model comparisons.
 - **Key Components:**  
   - **Conversation Table:** Stores all dialogue messages (user, assistant, results) along with timestamps.
   - **Successful Exchanges Table:** Caches successful prompt–response pairs based on similarity matching.
+  - **Model Comparisons Table:** Stores results from model comparison runs including:
+    - Response times
+    - Token counts
+    - Code execution results
+    - Success/failure status
   - Methods to query, insert, and match conversation data efficiently.
 
 ### 4. `agent/code_executor.py`
@@ -67,7 +73,24 @@ MacBot/
   - Implements an auto‑fix mechanism that, if code execution fails, queries the LLM for corrected code and retries execution.
   - Provides detailed logging of errors and execution results.
 
-### 5. `agent/llm_client.py`
+### 5. `agent/model_comparator.py`
+- **Purpose:**  
+  Implements functionality for comparing responses from different Ollama models.
+- **Key Features:**  
+  - **Model Discovery:**  
+    Asynchronously fetches available models from the Ollama API with retry logic.
+  - **Concurrent Execution:**  
+    Runs prompts against multiple models simultaneously using `asyncio.gather`.
+  - **Response Analysis:**  
+    - Tracks response times, token counts, and code execution results.
+    - Provides detailed analysis and comparison of model outputs.
+    - Generates formatted reports for easy comparison.
+  - **Error Handling:**  
+    Robust error handling for API failures, timeouts, and code execution issues.
+  - **Database Integration:**  
+    Stores comparison results for future reference and analysis.
+
+### 6. `agent/llm_client.py`
 - **Purpose:**  
   Implements an asynchronous client to interact with the LLM API.
 - **Key Features:**  
@@ -83,7 +106,7 @@ MacBot/
   - **Note:**  
     This module uses a unified approach to send LLM requests instead of branching based on a Gemini/Gemeni condition.
 
-### 6. `agent/agent.py`
+### 7. `agent/agent.py`
 - **Purpose:**  
   Houses the core logic of the AI agent, orchestrating conversation management, LLM interactions, and code execution.
 - **Key Features:**  
@@ -93,11 +116,15 @@ MacBot/
     - Uses the `get_llm_response_async` function to retrieve responses from the LLM API.
     - Extracts code blocks from responses and processes them concurrently with a semaphore-controlled auto‑fix loop.
   - **User Interaction Flow:**  
-    - Listens for user input with options to exit or launch a `/success` command for managing cached exchanges.
+    - Listens for user input with options to exit or launch various commands.
     - Reuses high-similarity cached responses to bypass unnecessary LLM calls.
     - Stores all interactions and successful exchanges in the database.
+  - **Model Comparison:**
+    - Implements the `/compare` command for comparing model responses.
+    - Supports comparing the last query or a new prompt.
+    - Displays detailed analysis of model performance and outputs.
 
-### 7. `agent/main.py`
+### 8. `agent/main.py`
 - **Purpose:**  
   Serves as the entry point for running the AI agent.
 - **Key Functionality:**  

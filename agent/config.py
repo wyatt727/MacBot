@@ -12,7 +12,12 @@ LLM_MODEL = "deepseek-coder-v2"
 
 # Execution parameters
 MAX_FIX_ATTEMPTS = 3
-CONTEXT_MSG_COUNT = 2  # Minimal context: system prompt + current user message
+
+# Number of similar examples to include in context
+MAX_SIMILAR_EXAMPLES = 2
+
+# Number of context messages to include
+CONTEXT_MSG_COUNT = 10
 
 # Database configuration
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "conversation.db")
