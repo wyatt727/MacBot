@@ -7,7 +7,7 @@ import re
 from collections import Counter
 from .config import (
     DB_FILE, CONTEXT_MSG_COUNT, MAX_SIMILAR_EXAMPLES,
-    SIMILARITY_THRESHOLD, CACHE_TTL
+    SIMILARITY_THRESHOLD
 )
 import json
 from datetime import datetime, timedelta
@@ -84,6 +84,11 @@ def calculate_similarity_score(query: str, stored: str) -> float:
         duration = time.perf_counter() - start
         timings[name] = duration
         return duration
+
+    # Check for exact match first (case-insensitive)
+    if query.lower().strip() == stored.lower().strip():
+        track_timing('total', start_time)
+        return 1.0
 
     # Preprocess both texts
     preprocess_start = time.perf_counter()
@@ -231,6 +236,15 @@ class ConversationDB:
         self._initialize_defaults()
         self._prepare_statements()
         
+        # Create settings table if it doesn't exist
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        self.conn.commit()
+        
     def _setup_connection(self):
         """Setup database connection with optimized settings."""
         self.conn = sqlite3.connect(
@@ -361,16 +375,20 @@ class ConversationDB:
 
     @lru_cache(maxsize=1000)
     def find_successful_exchange(self, user_prompt: str, threshold: float = SIMILARITY_THRESHOLD) -> List[Tuple[str, str, float]]:
-        """Cached version of similarity search that always returns at least the best match."""
+        """
+        Find similar successful exchanges in the database.
+        Returns a list of tuples (prompt, response, similarity_score) sorted by similarity.
+        The results are not filtered by threshold - that's handled by the caller.
+        """
         start_time = time.perf_counter()
         timings = {}
-
+        
         def track_timing(name: str, start: float) -> float:
             duration = time.perf_counter() - start
             timings[name] = duration
             return duration
-
-        # Database query - search ALL exchanges, not just recent ones
+        
+        # Database query - search ALL exchanges
         query_start = time.perf_counter()
         cur = self.conn.execute(
             "SELECT user_prompt, assistant_response FROM successful_exchanges"
@@ -379,39 +397,33 @@ class ConversationDB:
         track_timing('database_query', query_start)
         
         if not rows:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"\n[Performance] No matches found in {track_timing('total', start_time)*1000:.2f}ms")
+            logger.debug(f"No exchanges found in database for prompt: {user_prompt}")
             return []
-        
+            
         # Calculate similarity scores
         scoring_start = time.perf_counter()
         matches = [(stored_prompt, stored_response, calculate_similarity_score(user_prompt, stored_prompt))
                   for stored_prompt, stored_response in rows]
         track_timing('similarity_scoring', scoring_start)
         
-        # Sort and filter matches
+        # Sort matches by similarity
         sort_start = time.perf_counter()
         sorted_matches = sorted(matches, key=lambda x: x[2], reverse=True)
-        best_match = sorted_matches[0]
         
-        # Get all matches above threshold, up to MAX_SIMILAR_EXAMPLES
-        additional_matches = [match for match in sorted_matches[1:] 
-                            if match[2] >= threshold][:MAX_SIMILAR_EXAMPLES-1]
+        # Get top matches up to MAX_SIMILAR_EXAMPLES
+        filtered_matches = sorted_matches[:MAX_SIMILAR_EXAMPLES] if MAX_SIMILAR_EXAMPLES > 0 else []
         track_timing('sort_and_filter', sort_start)
         
-        # Only log performance metrics at debug level
+        # Log performance metrics at debug level
         if logger.isEnabledFor(logging.DEBUG):
             total_time = track_timing('total', start_time)
-            logger.debug(f"\n[Performance] Found {len(matches)} potential matches in {total_time*1000:.2f}ms")
-            logger.debug(f"Best match similarity: {best_match[2]:.2%}")
-            logger.debug(f"Additional matches: {len(additional_matches)}")
-            logger.debug(f"Time breakdown:")
-            for component, duration in timings.items():
-                if component != 'total':
-                    percentage = (duration / total_time) * 100
-                    logger.debug(f"- {component}: {duration*1000:.2f}ms ({percentage:.1f}%)")
-        
-        return [best_match] + additional_matches
+            if filtered_matches:
+                logger.debug(f"Found {len(filtered_matches)} similar examples in {total_time*1000:.2f}ms")
+                logger.debug(f"Best match similarity: {filtered_matches[0][2]:.2%}")
+            else:
+                logger.debug(f"No similar examples found (checked {len(rows)} exchanges in {total_time*1000:.2f}ms)")
+            
+        return filtered_matches
 
     def list_successful_exchanges(self, search_term: str = "", offset: int = 0, limit: int = 100) -> List[Dict]:
         """
@@ -819,3 +831,17 @@ class ConversationDB:
             cur.execute("ROLLBACK")
             logger.error(f"Database error updating exchange {exchange_id}: {e}")
             return False
+
+    def get_setting(self, key: str) -> Optional[str]:
+        """Get a setting value by key."""
+        cur = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Set a setting value by key."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, value)
+        )
+        self.conn.commit()

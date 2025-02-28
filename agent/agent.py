@@ -15,7 +15,7 @@ from .code_executor import execute_code_async
 from .config import (
     LLM_MODEL, MAX_CONCURRENT_LLM_CALLS, 
     MAX_CONCURRENT_CODE_EXECUTIONS, RESPONSE_TIMEOUT,
-    SIMILARITY_THRESHOLD
+    SIMILARITY_THRESHOLD, DEBUG_MODE
 )
 
 logger = logging.getLogger(__name__)
@@ -90,10 +90,10 @@ class MinimalAIAgent:
       - The current user query.
     This context is then sent to the LLM.
     """
-    def __init__(self, model: str = LLM_MODEL):
+    def __init__(self, model: str = LLM_MODEL, command_timeout: int = 60):
         self.model = model
         self.db = ConversationDB()
-        self.last_user_query = ""
+        self.last_user_query = self.db.get_setting("last_user_query") or ""
         self.aiohttp_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=RESPONSE_TIMEOUT)
         )
@@ -102,11 +102,32 @@ class MinimalAIAgent:
         self.code_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CODE_EXECUTIONS)
         self.command_history = CommandHistory()
         self.session_start = datetime.now()
-        self.in_comparison_mode = False
+        self.in_comparison_mode = self.db.get_setting("in_comparison_mode") == "true"
         
-        # Response cache
-        self._response_cache = {}
-        self._cache_lock = asyncio.Lock()
+        # Ollama-specific optimizations
+        self.ollama_config = {
+            "num_thread": os.cpu_count() or 4,  # Default to CPU count or 4
+            "num_gpu": 0,  # Default to CPU-only mode
+            "timeout": RESPONSE_TIMEOUT
+        }
+        
+        # Load Ollama config from environment or settings
+        if os.getenv("OLLAMA_NUM_THREAD"):
+            self.ollama_config["num_thread"] = int(os.getenv("OLLAMA_NUM_THREAD"))
+        if os.getenv("OLLAMA_NUM_GPU"):
+            self.ollama_config["num_gpu"] = int(os.getenv("OLLAMA_NUM_GPU"))
+        
+        # Store default timeout for restoration after /notimeout
+        self.default_timeout = RESPONSE_TIMEOUT
+        
+        # Performance tracking
+        self.performance_metrics = {
+            "llm_calls": 0,
+            "cache_hits": 0,
+            "total_llm_time": 0,
+            "avg_llm_time": 0,
+            "timeouts": 0
+        }
         
         # Initialize command aliases and shortcuts
         self.command_aliases = {
@@ -118,53 +139,61 @@ class MinimalAIAgent:
             '/repeat': self.repeat_last_command,
             '/success': self.process_success_command,
             '/compare': self.compare_models_command,
-            '/nocache': lambda x: x  # Pass-through for nocache command
+            '/nocache': lambda x: x.replace('/nocache ', ''),
+            '/notimeout': lambda x: x.replace('/notimeout ', ''),
+            '/perf': self.show_performance_metrics
         }
 
     async def show_help(self, _: str):
         """Show help information about available commands."""
         help_text = """
-Available Commands:
-------------------
-Up/Down Arrow : Navigate through command history
-Ctrl+R       : Search command history
-Tab          : Auto-complete commands
-/h, /help    : Show this help message
-/history     : Show command history
-/clear       : Clear the screen
-/stats       : Show session statistics
-/repeat      : Repeat last command
-/success     : Manage successful exchanges
-/compare     : Compare responses across all available models
-/bye, exit   : Exit the agent
-
-Model Comparison:
----------------
-Use /compare [prompt] to run a prompt against all available models and compare their:
-- Response times
-- Token counts
-- Code execution results
-- Success rates
-
-If no prompt is provided, the last query will be used.
-
-Tips:
------
-- Use arrow keys to navigate through previous commands
-- Commands are automatically saved and persisted between sessions
-- Use Tab for command auto-completion
-- Ctrl+C to cancel current operation
-"""
+╭─ Available Commands ─────────────────────────────────────────────
+│
+│  Navigation
+│  • Up/Down Arrow : Browse history
+│  • Ctrl+R       : Search history
+│  • Tab          : Auto-complete
+│
+│  Basic Commands
+│  • /h, /help    : Show this help
+│  • /clear       : Clear screen
+│  • /history     : Show history
+│  • /stats       : Show statistics
+│  • /repeat      : Repeat last command
+│  • /perf        : Show performance
+│
+│  Advanced
+│  • /success     : Manage exchanges
+│  • /compare     : Compare models
+│  • /nocache     : Skip cache
+│  • /notimeout   : Disable timeout
+│  • exit, /bye   : Exit MacBot
+│
+│  Tips
+│  • Commands are saved between sessions
+│  • Use Tab for quick completion
+│  • Ctrl+C to cancel operations
+│
+╰──────────────────────────────────────────────────────────────────"""
         print(help_text)
 
     async def show_command_history(self, _: str):
         """Show the command history with timestamps."""
-        print("\nCommand History:")
-        print("-" * 50)
+        history = []
         for i in range(1, readline.get_current_history_length() + 1):
             cmd = readline.get_history_item(i)
-            print(f"{i:3d}. {cmd}")
-        print("-" * 50)
+            history.append(f"│  {i:3d} │ {cmd}")
+        
+        if not history:
+            print("\n╭─ Command History ─── Empty ─────────────────────────────")
+            print("╰────────────────────────────────────────────────────────")
+            return
+            
+        width = max(len(line) for line in history) + 2
+        print("\n╭─ Command History ─" + "─" * (width - 19))
+        for line in history:
+            print(line + " " * (width - len(line)))
+        print("╰" + "─" * width)
 
     async def clear_screen(self, _: str):
         """Clear the terminal screen."""
@@ -173,13 +202,31 @@ Tips:
     async def show_session_stats(self, _: str):
         """Show statistics for the current session."""
         duration = datetime.now() - self.session_start
+        hours = duration.seconds // 3600
+        minutes = (duration.seconds % 3600) // 60
+        seconds = duration.seconds % 60
+        
+        duration_str = []
+        if hours > 0:
+            duration_str.append(f"{hours}h")
+        if minutes > 0 or hours > 0:
+            duration_str.append(f"{minutes}m")
+        duration_str.append(f"{seconds}s")
+        
         total_commands = readline.get_current_history_length()
-        print("\nSession Statistics:")
-        print("-" * 50)
-        print(f"Session Duration: {duration}")
-        print(f"Commands Executed: {total_commands}")
-        print(f"Successful Exchanges: {len(self.db.list_successful_exchanges())}")
-        print("-" * 50)
+        successful = len(self.db.list_successful_exchanges())
+        
+        stats = f"""
+╭─ Session Statistics ────────────────────────────────────────
+│
+│  ⏱  Duration    : {" ".join(duration_str)}
+│  ⌨️  Commands    : {total_commands}
+│  ✓  Successful  : {successful}
+│  🔄 Cache Hits  : {self.performance_metrics['cache_hits']}
+│  ⚡ LLM Calls   : {self.performance_metrics['llm_calls']}
+│
+╰──────────────────────────────────────────────────────────"""
+        print(stats)
 
     async def repeat_last_command(self, _: str):
         """Repeat the last command."""
@@ -268,98 +315,236 @@ Tips:
         async with self.code_semaphore:
             return await self.process_code_block(language, code)
 
-    async def _get_cached_response(self, prompt: str) -> Optional[str]:
-        """Get response from cache if available and not expired."""
-        async with self._cache_lock:
-            if prompt in self._response_cache:
-                timestamp, response = self._response_cache[prompt]
-                if datetime.now() - timestamp < timedelta(seconds=CACHE_TTL):
-                    return response
-                del self._response_cache[prompt]
-            return None
-
-    async def _cache_response(self, prompt: str, response: str):
-        """Cache a response with timestamp."""
-        async with self._cache_lock:
-            self._response_cache[prompt] = (datetime.now(), response)
-
     async def _process_code_blocks_parallel(self, blocks: List[Tuple[str, str]]) -> List[Tuple[int, str]]:
         """Process code blocks in parallel with optimized concurrency."""
-        if not blocks:
-            return []
-            
-        async def process_block(block: Tuple[str, str]) -> Tuple[int, str]:
-            lang, code = block
-            async with self.code_semaphore:
-                return await self.process_code_block(lang, code)
+        start_time = datetime.now()
+        results = []
         
-        return await asyncio.gather(*(process_block(block) for block in blocks))
+        if blocks:
+            print("\n┌─ Code Execution " + "─" * 50)
+            
+        for idx, (lang, code) in enumerate(blocks, 1):
+            if len(blocks) > 1:
+                print(f"\n├─ Block #{idx}")
+            print(f"│  {lang}")
+            print("│")
+            for line in code.strip().split('\n'):
+                print(f"│  {line}")
+            print("│")
+            
+            async with self.code_semaphore:
+                exec_start = datetime.now()
+                ret, output = await self.process_code_block(lang, code)
+                exec_time = (datetime.now() - exec_start).total_seconds()
+                results.append((ret, output))
+                
+                if output.strip():
+                    print("│")
+                    print("│  Result:")
+                    for line in output.strip().split('\n'):
+                        print(f"│  {line}")
+                if DEBUG_MODE:
+                    print(f"│  Time: {exec_time:.2f}s")
+            print("│")
+        
+        if blocks:
+            if DEBUG_MODE:
+                total_time = (datetime.now() - start_time).total_seconds()
+                print(f"└─ Total time: {total_time:.2f}s")
+            else:
+                print("└" + "─" * 60)
+        return results
 
-    async def process_message(self, message: str, no_cache: bool = False) -> str:
-        """Optimized message processing with caching and parallel execution."""
+    async def show_performance_metrics(self, _: str):
+        """Show detailed performance metrics."""
+        metrics = f"""
+╭─ Performance Metrics ──────────────────────────────────────
+│
+│  LLM Statistics
+│  • Total Calls : {self.performance_metrics['llm_calls']}
+│  • Cache Hits  : {self.performance_metrics['cache_hits']}"""
+
+        if self.performance_metrics['llm_calls'] > 0:
+            metrics += f"""
+│  • Avg Time    : {self.performance_metrics['avg_llm_time']:.1f}s
+│  • Total Time  : {self.performance_metrics['total_llm_time']:.1f}s"""
+
+        metrics += f"""
+│  • Timeouts    : {self.performance_metrics['timeouts']}
+│
+│  Ollama Configuration
+│  • CPU Threads : {self.ollama_config['num_thread']}
+│  • GPU Layers  : {self.ollama_config['num_gpu']}
+│
+╰──────────────────────────────────────────────────────────"""
+        print(metrics)
+
+    async def process_message(self, message: str, no_cache: bool = False) -> Tuple[str, bool]:
+        """
+        Optimized message processing using only SQLite for caching.
+        Returns: Tuple[response: str, was_cached: bool]
+        """
+        start_time = datetime.now()
+        phase = "initialization"
+        
+        # Check for /notimeout flag
+        use_extended_timeout = False
+        if message.startswith('/notimeout '):
+            use_extended_timeout = True
+            message = message[10:].strip()  # Remove /notimeout prefix
+            original_timeout = self.ollama_config["timeout"]
+            self.ollama_config["timeout"] = 0  # Disable timeout
+            print("ℹ️  Timeout disabled - will wait indefinitely for response")
+            
+            # Also update aiohttp session timeout
+            self.aiohttp_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=0)  # 0 means no timeout
+            )
+            
         try:
-            # Check for high similarity matches first (if caching is enabled)
             if not no_cache:
-                # Find similar exchanges
+                phase = "database_lookup"
                 similar_exchanges = self.db.find_successful_exchange(message)
+                
                 if similar_exchanges:
-                    best_match = similar_exchanges[0]  # (prompt, response, similarity)
-                    # Check for exact match first
-                    if best_match[0].lower().strip() == message.lower().strip():
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug("\n[Cache] Found exact match")
-                        return best_match[1]
-                    # Otherwise check for high similarity
-                    elif best_match[2] >= 0.93:  # If similarity is 93% or higher
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(f"\n[Cache] Found highly similar match (similarity: {best_match[2]:.2%})")
-                            logger.debug(f"Original prompt: {best_match[0]}")
+                    best_match = similar_exchanges[0]
+                    similarity = best_match[2]
+                    
+                    if similarity >= SIMILARITY_THRESHOLD:
+                        print("\n╭─ Cache Hit ─────────────────────────────────────────")
+                        if similarity == 1.0:
+                            print("│  ✓ Exact match found")
+                        else:
+                            print(f"│  ✓ Similar response found ({similarity:.1%} match)")
+                            print("│")
+                            print("│  Similar query:")
+                            print(f"│  • {best_match[0]}")
+                        
+                        if DEBUG_MODE:
+                            lookup_time = (datetime.now() - start_time).total_seconds()
+                            print(f"│  ⏱  Lookup: {lookup_time:.2f}s")
+                        
+                        print("╰──────────────────────────────────────────────────────")
+                        
+                        self.performance_metrics["cache_hits"] += 1
                         cached_response = best_match[1]
                         
-                        # Extract and execute code blocks immediately
                         blocks = self.extract_code_from_response(cached_response)
                         if blocks:
                             results = await self._process_code_blocks_parallel(blocks)
-                            for idx, (ret, output) in enumerate(results, 1):
-                                print(f"\n--- Code Block #{idx} Execution Result ---\n{output}\n")
                         
-                        return cached_response
-
-            # If no high similarity match or caching disabled, proceed with normal processing
+                        return cached_response, True
+            
+            phase = "llm_processing"
+            print("\n╭─ Generating Response ───────────────────────────────────")
+            print("│  ⟳ Processing request...")
+            
+            # Show similar examples even if below threshold
+            if not no_cache and similar_exchanges:
+                best_match = similar_exchanges[0]
+                similarity = best_match[2]
+                if similarity >= 0.5:  # Only show if somewhat relevant
+                    print("│")
+                    print("│  Similar examples found:")
+                    for query, response, sim in similar_exchanges[:3]:  # Show top 3
+                        match_type = "Excellent" if sim >= 0.9 else "Good" if sim >= 0.7 else "Partial"
+                        preview = response.split('\n')[0][:50] + "..." if len(response) > 50 else response
+                        print(f"│  • {match_type} ({sim:.1%}): '{query}' → '{preview}'")
+                    print("│")
+                    print("│  ℹ️  Using examples for context but generating new response")
+                    print("│     (similarity below cache threshold)")
+            
+            if DEBUG_MODE:
+                context_start = datetime.now()
+            
             context = await self._build_context(message, no_cache=no_cache)
-            async with self.llm_semaphore:
-                response = await get_llm_response_async(
-                    context, 
-                    self.model, 
-                    self.aiohttp_session
+            
+            if DEBUG_MODE:
+                context_time = (datetime.now() - context_start).total_seconds()
+                print(f"│  ⏱  Context: {context_time:.2f}s")
+            
+            llm_start = datetime.now()
+            try:
+                async with self.llm_semaphore:
+                    response = await get_llm_response_async(
+                        context, 
+                        self.model, 
+                        self.aiohttp_session,
+                        num_thread=self.ollama_config["num_thread"],
+                        num_gpu=self.ollama_config["num_gpu"]
+                    )
+                llm_time = (datetime.now() - llm_start).total_seconds()
+                
+                # Update performance metrics
+                self.performance_metrics["llm_calls"] += 1
+                self.performance_metrics["total_llm_time"] += llm_time
+                self.performance_metrics["avg_llm_time"] = (
+                    self.performance_metrics["total_llm_time"] / 
+                    self.performance_metrics["llm_calls"]
                 )
+                
+                if llm_time > 10:
+                    print(f"│  ⚠  Slow response ({llm_time:.1f}s)")
+                elif DEBUG_MODE:
+                    print(f"│  ⏱  LLM: {llm_time:.1f}s")
+                    
+            except asyncio.TimeoutError:
+                self.performance_metrics["timeouts"] += 1
+                raise TimeoutError(f"Response timed out after {RESPONSE_TIMEOUT}s")
+            except Exception as e:
+                logger.error(f"LLM response error: {str(e)}")
+                print("│")
+                print("│  ❌ LLM Response Failed:")
+                print(f"│  • Error: {str(e)}")
+                if hasattr(e, 'response') and e.response:
+                    try:
+                        error_json = await e.response.json()
+                        if 'error' in error_json:
+                            print(f"│  • Details: {error_json['error']}")
+                    except:
+                        if hasattr(e, 'response'):
+                            error_text = await e.response.text()
+                            print(f"│  • Details: {error_text[:200]}")
+                print("│")
+                raise
+            
+            blocks = self.extract_code_from_response(response)
+            
+            if not self.in_comparison_mode and not no_cache and blocks:
+                self.db.add_successful_exchange(message, response)
+                if DEBUG_MODE:
+                    print("│  ✓ Response cached")
+            
+            if DEBUG_MODE:
+                total_time = (datetime.now() - start_time).total_seconds()
+                print(f"│  ⏱  Total: {total_time:.2f}s")
+            print("╰──────────────────────────────────────────────────────")
+            
+            # Execute code blocks immediately for non-cached responses
+            if blocks:
+                await self._process_code_blocks_parallel(blocks)
+            
+            return response, False
 
-            # Save successful exchanges if not in comparison mode and caching is enabled
-            if not self.in_comparison_mode and not no_cache:
-                # Check if the response contains valid code blocks
-                blocks = self.extract_code_from_response(response)
-                if blocks:
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug("\n[DB] Adding successful exchange to database")
-                    if self.db.add_successful_exchange(message, response):
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug("[DB] Successfully added to database")
-                    else:
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug("[DB] Exchange already exists in database")
-
-            # Cache the response if appropriate
-            if not no_cache and response:
-                await self._cache_response(message, response)
-
-            return response
-
-        except asyncio.TimeoutError:
-            logger.error("LLM request timed out")
-            return "Error: Request timed out. Please try again."
         except Exception as e:
-            logger.error(f"Error processing message: {e}")
-            return f"Error processing message: {str(e)}"
+            total_time = (datetime.now() - start_time).total_seconds()
+            print("\n╭─ Error ────────────────────────────────────────────────")
+            print(f"│  ❌ {phase}: {str(e)}")
+            if DEBUG_MODE:
+                print(f"│  ⏱  Time: {total_time:.1f}s")
+            print("╰──────────────────────────────────────────────────────")
+            logger.error(f"Error in {phase}: {e}")
+            return f"❌ Error in {phase}: {str(e)}", False
+
+        finally:
+            # Restore original timeout if it was changed
+            if use_extended_timeout:
+                self.ollama_config["timeout"] = original_timeout
+                # Restore aiohttp session with default timeout
+                await self.aiohttp_session.close()
+                self.aiohttp_session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=self.default_timeout)
+                )
 
     def help_command(self) -> str:
         """Return help text describing available commands."""
@@ -402,128 +587,148 @@ Examples:
         Process a /success command by launching the GUI for managing successful exchanges.
         The GUI is launched as a separate process so that all GUI code runs on the main thread.
         """
-        print("Launching Success DB GUI...")
+        print("\n⟳ Launching Success DB GUI...")
         try:
             proc = subprocess.Popen([sys.executable, "-m", "agent.gui_success"])
             if proc.pid:
-                print(f"Success DB GUI launched (PID: {proc.pid}).")
+                print(f"✓ GUI launched (PID: {proc.pid})")
             else:
-                print("Failed to launch Success DB GUI: No PID returned.")
+                print("❌ Failed to launch GUI: No PID returned")
         except Exception as e:
-            print(f"Failed to launch Success DB GUI: {e}")
+            print(f"❌ Failed to launch GUI: {e}")
 
     async def compare_models_command(self, command: str):
         """
         Triggers model comparison mode for the last query or a new query.
         Responses from comparison mode are not saved as successful exchanges.
-        
-        Usage:
-            /compare [prompt]  - Compare models using a new prompt
-            /compare          - Compare models using the last query
         """
         from .model_comparator import compare_models, analyze_results
         
-        # Parse command to get optional prompt
         parts = command.split(maxsplit=1)
         prompt = parts[1] if len(parts) > 1 else self.last_user_query
         
         if not prompt:
-            print("Please enter a prompt first or provide one with the command.")
+            print("\n❌ Please enter a prompt first or provide one with the command")
             return
             
         try:
-            print(f"\nRunning comparison for prompt: {prompt}")
-            print("This may take a while depending on the number of available models...")
+            print(f"\n╭─ Model Comparison ────────────────────────────────────")
+            print(f"│  Prompt: {prompt}")
+            print(f"│  Status: Running comparison across available models...")
+            print(f"├────────────────────────────────────────────────────────")
             
-            # Set a flag to prevent responses from being saved during comparison
             self.in_comparison_mode = True
+            self.db.set_setting("in_comparison_mode", "true")
             try:
                 results = await compare_models(prompt, self.aiohttp_session, self.db)
             finally:
                 self.in_comparison_mode = False
+                self.db.set_setting("in_comparison_mode", "false")
             
             if not results:
-                print("\nNo results returned from model comparison.")
+                print("│  ❌ No results returned")
+                print("╰────────────────────────────────────────────────────────")
                 return
                 
             analysis = analyze_results(results)
             print(analysis)
+            print("╰────────────────────────────────────────────────────────")
             
         except Exception as e:
             logger.error(f"Error during model comparison: {e}")
-            print(f"\nError during model comparison: {e}")
-            print("Please try again or check the logs for more details.")
+            print(f"│  ❌ Error: {e}")
+            print("╰────────────────────────────────────────────────────────")
 
     async def run(self):
         """Enhanced main loop with optimized processing."""
-        print("Minimal AI Agent for macOS (Local Mode).")
-        print('Type "/h" or "/help" for available commands.')
+        print("""
+╭─ MacBot AI Agent ─────────────────────────────────────────────
+│
+│  Welcome! Type /h for help, or just start chatting.
+│  Use arrow keys ↑↓ to browse history, Tab for completion.
+│
+╰──────────────────────────────────────────────────────────────""")
+        
         try:
             while True:
                 try:
-                    user_input = await asyncio.to_thread(input, "User: ")
+                    user_input = await asyncio.to_thread(input, "\n❯ ")
                     
-                    # Quick exit check
                     if user_input.lower() in ("exit", "quit", "/bye"):
+                        print("\n✓ Goodbye!")
                         break
 
-                    # Handle empty input
                     if not user_input.strip():
-                        user_input = self.last_user_query
-                        if not user_input:
+                        if self.last_user_query:
+                            print("ℹ️  Repeating last query...")
+                            user_input = self.last_user_query
+                        else:
                             continue
 
-                    # Process command flags
                     no_cache = False
+                    use_extended_timeout = False
+                    
+                    # Handle command flags
                     if user_input.startswith('/nocache '):
                         no_cache = True
                         user_input = user_input[9:].strip()
+                        print("ℹ️  Cache disabled for this query")
                     
-                    # Handle special commands
-                    if user_input.startswith('/'):
-                        command = user_input.split()[0].lower()
-                        if command in self.command_aliases:
-                            result = await self.command_aliases[command](user_input)
-                            if isinstance(result, str):
-                                user_input = result
-                            else:
-                                continue
-
-                    # Add to history and update last query
-                    self.command_history.add_command(user_input)
-                    self.last_user_query = user_input
-
-                    # Process message and handle response
-                    response = await self.process_message(user_input, no_cache=no_cache)
-                    print("\n[Response]\n", response)
-
-                    # Extract and process code blocks in parallel
-                    blocks = self.extract_code_from_response(response)
-                    if blocks:
-                        results = await self._process_code_blocks_parallel(blocks)
-                        for idx, (ret, output) in enumerate(results, 1):
-                            print(f"\n--- Code Block #{idx} Execution Result ---\n{output}\n")
+                    if user_input.startswith('/notimeout '):
+                        use_extended_timeout = True
+                        user_input = user_input[10:].strip()
+                        original_timeout = self.ollama_config["timeout"]
+                        self.ollama_config["timeout"] = 0  # Disable timeout
+                        print("ℹ️  Timeout disabled - will wait indefinitely for response")
                     
-                    # Update conversation history
-                    self.db.add_message("user", user_input)
-                    self.db.add_message("assistant", response)
+                    try:
+                        if user_input.startswith('/'):
+                            command = user_input.split()[0].lower()
+                            if command in self.command_aliases:
+                                if command not in ['/nocache', '/notimeout']:
+                                    result = await self.command_aliases[command](user_input)
+                                    if isinstance(result, str):
+                                        user_input = result
+                                    else:
+                                        continue
+
+                        self.command_history.add_command(user_input)
+                        self.db.set_setting("last_user_query", user_input)
+                        self.last_user_query = user_input
+
+                        response, was_cached = await self.process_message(user_input, no_cache=no_cache)
+                        
+                        # Store the interaction in the database
+                        self.db.add_message("user", user_input)
+                        self.db.add_message("assistant", response)
+                    
+                    finally:
+                        # Restore timeout if it was changed
+                        if use_extended_timeout:
+                            self.ollama_config["timeout"] = original_timeout
 
                 except KeyboardInterrupt:
-                    print("\nOperation cancelled. Type 'exit' to quit or continue with a new command.")
+                    print("\n\n⨯ Operation cancelled")
+                    continue
                 except Exception as e:
-                    logger.error(f"Error processing command: {e}")
-                    print(f"\nError: {e}")
-                    print("Type '/h' for help or continue with a new command.")
+                    logger.error(f"Error: {e}")
+                    print(f"\n❌ Error: {str(e)}")
         finally:
-            # Cleanup
             await self._cleanup()
 
     async def _cleanup(self):
         """Clean up resources."""
+        print("""
+╭─ Session Summary ──────────────────────────────────────────────
+│
+│  ✓ History saved
+│  ✓ Database closed
+│  ✓ Resources cleaned up
+│
+╰──────────────────────────────────────────────────────────────""")
         self.command_history.save_history()
         await self.aiohttp_session.close()
         self.db.close()
-        print("Agent exited. Command history saved.")
 
 if __name__ == "__main__":
     asyncio.run(MinimalAIAgent(model=LLM_MODEL).run())

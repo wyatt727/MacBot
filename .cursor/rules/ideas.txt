@@ -1,0 +1,8 @@
+Actionable Steps (in order of likely impact):
+Revise system-prompt.txt: This is the highest priority. Experiment with:
+A much more detailed description of the agent's role and desired behavior.
+Explicit instructions on how to format responses (including code blocks).
+A few high-quality, hand-crafted examples of input/output pairs.
+Experiment with LLM_MODEL: Try different models available through your Ollama setup.
+Consider adding temperature/top-p control: Expose these as configuration options.
+Implement response validation and self-correction: If the LLM response is not in the expected format, send it back to the LLM for correction.

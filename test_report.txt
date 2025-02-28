@@ -1,0 +1,205 @@
+
+================================================================================
+Test Summary Report
+================================================================================
+Run Date: 2025-02-28 13:16:05
+Total Tests: 32
+Total Time: 1.772s
+Successes: 27
+Failures: 2
+Errors: 3
+Skipped: 0
+
+
+================================================================================
+Successful Tests:
+================================================================================
+✅ TestSystemPrompt.test_get_base_system_prompt - 0.008s
+✅ TestSystemPrompt.test_get_system_prompt_file_error - 0.017s
+✅ TestSystemPrompt.test_get_system_prompt_no_message - 0.003s
+✅ TestSystemPrompt.test_get_system_prompt_no_similar_examples - 0.004s
+✅ TestSystemPrompt.test_get_system_prompt_with_similar_examples - 0.004s
+✅ TestConversationDB.test_database_persistence - 0.007s
+✅ TestConversationDB.test_settings - 0.001s
+✅ TestConversationDB.test_successful_exchange_exact_match - 0.001s
+✅ TestConversationDB.test_successful_exchange_no_match - 0.001s
+✅ TestConversationDB.test_successful_exchange_search - 0.001s
+✅ TestConversationDB.test_successful_exchange_similar_match - 0.001s
+✅ TestMinimalAIAgent.test_build_context - 0.024s
+✅ TestMinimalAIAgent.test_code_execution - 0.007s
+✅ TestMinimalAIAgent.test_process_message_nocache_flag - 0.025s
+✅ TestCodeExecutor.test_code_block_extraction - 0.001s
+✅ TestCodeExecutor.test_concurrent_execution - 0.066s
+✅ TestCodeExecutor.test_file_operations - 0.074s
+✅ TestCodeExecutor.test_python_code_execution - 0.254s
+✅ TestCodeExecutor.test_sh_code_execution - 0.060s
+✅ TestCodeExecutor.test_timeout_handling - 1.013s
+✅ TestLLMClient.test_concurrent_requests - 0.072s
+✅ TestLLMClient.test_context_validation - 0.005s
+✅ TestLLMClient.test_empty_response - 0.021s
+✅ TestLLMClient.test_error_response - 0.020s
+✅ TestLLMClient.test_malformed_response - 0.019s
+✅ TestLLMClient.test_normal_response - 0.020s
+✅ TestLLMClient.test_timeout_handling - 0.014s
+
+================================================================================
+Failed Tests:
+================================================================================
+
+❌ TestConversationDB.test_add_and_get_message
+Details:
+Traceback (most recent call last):
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 57, in testPartExecutor
+    yield
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 623, in run
+    self._callTestMethod(testMethod)
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 579, in _callTestMethod
+    if method() is not None:
+       ^^^^^^^^
+  File "/Users/pentester/Tools/MacBot/tests/test_db.py", line 29, in test_add_and_get_message
+    self.assertEqual(messages[0]["content"], test_message)
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 873, in assertEqual
+    assertion_func(first, second, msg=msg)
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 1253, in assertMultiLineEqual
+    self.fail(self._formatMessage(msg, standardMsg))
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 703, in fail
+    raise self.failureException(msg)
+AssertionError: 'open google but make the background red' != 'test message'
+- open google but make the background red
++ test message
+
+
+
+❌ TestMinimalAIAgent.test_command_history
+Details:
+Traceback (most recent call last):
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 57, in testPartExecutor
+    yield
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 623, in run
+    self._callTestMethod(testMethod)
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/async_case.py", line 90, in _callTestMethod
+    if self._callMaybeAsync(method) is not None:
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/async_case.py", line 112, in _callMaybeAsync
+    return self._asyncioRunner.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/pentester/Tools/MacBot/tests/test_agent.py", line 125, in test_command_history
+    self.assertIn(cmd, history)
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 1140, in assertIn
+    self.fail(self._formatMessage(msg, standardMsg))
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 703, in fail
+    raise self.failureException(msg)
+AssertionError: 'ls -l' not found in ''
+
+
+================================================================================
+Tests with Errors:
+================================================================================
+
+❌ TestMinimalAIAgent.test_process_message_cached
+Details:
+Traceback (most recent call last):
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 57, in testPartExecutor
+    yield
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 623, in run
+    self._callTestMethod(testMethod)
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/async_case.py", line 90, in _callTestMethod
+    if self._callMaybeAsync(method) is not None:
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/async_case.py", line 112, in _callMaybeAsync
+    return self._asyncioRunner.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/pentester/Tools/MacBot/tests/test_agent.py", line 67, in test_process_message_cached
+    response, was_cached = await self.agent.process_message("whoami")
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/pentester/Tools/MacBot/agent/agent.py", line 303, in process_message
+    similar_exchange = self.db.find_similar_exchange(message)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/pentester/Tools/MacBot/agent/db.py", line 867, in find_similar_exchange
+    cursor = self.conn.execute("""
+             ^^^^^^^^^^^^^^^^^^^^^
+sqlite3.OperationalError: no such table: exchanges
+
+
+❌ TestMinimalAIAgent.test_process_message_no_cache
+Details:
+Traceback (most recent call last):
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 57, in testPartExecutor
+    yield
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 623, in run
+    self._callTestMethod(testMethod)
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/async_case.py", line 90, in _callTestMethod
+    if self._callMaybeAsync(method) is not None:
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/async_case.py", line 112, in _callMaybeAsync
+    return self._asyncioRunner.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/pentester/Tools/MacBot/tests/test_agent.py", line 86, in test_process_message_no_cache
+    result = await agent.process_message("print hello")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/pentester/Tools/MacBot/agent/agent.py", line 303, in process_message
+    similar_exchange = self.db.find_similar_exchange(message)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/pentester/Tools/MacBot/agent/db.py", line 867, in find_similar_exchange
+    cursor = self.conn.execute("""
+             ^^^^^^^^^^^^^^^^^^^^^
+sqlite3.OperationalError: no such table: exchanges
+
+
+❌ TestMinimalAIAgent.test_special_commands
+Details:
+Traceback (most recent call last):
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 57, in testPartExecutor
+    yield
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/case.py", line 623, in run
+    self._callTestMethod(testMethod)
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/async_case.py", line 90, in _callTestMethod
+    if self._callMaybeAsync(method) is not None:
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/unittest/async_case.py", line 112, in _callMaybeAsync
+    return self._asyncioRunner.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/pentester/Tools/MacBot/tests/test_agent.py", line 154, in test_special_commands
+    await self.agent.process_message("test query")
+  File "/Users/pentester/Tools/MacBot/agent/agent.py", line 303, in process_message
+    similar_exchange = self.db.find_similar_exchange(message)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/pentester/Tools/MacBot/agent/db.py", line 867, in find_similar_exchange
+    cursor = self.conn.execute("""
+             ^^^^^^^^^^^^^^^^^^^^^
+sqlite3.OperationalError: no such table: exchanges
+
+
+================================================================================
+Performance Analysis:
+================================================================================
+Slowest Tests:
+• tests.test_code_executor.TestCodeExecutor.test_timeout_handling: 1.013s
+• tests.test_code_executor.TestCodeExecutor.test_python_code_execution: 0.254s
+• tests.test_code_executor.TestCodeExecutor.test_file_operations: 0.074s
+• tests.test_llm_client.TestLLMClient.test_concurrent_requests: 0.072s
+• tests.test_code_executor.TestCodeExecutor.test_concurrent_execution: 0.066s

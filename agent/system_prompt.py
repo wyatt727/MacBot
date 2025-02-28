@@ -5,7 +5,7 @@ import logging
 import aiofiles
 from typing import List, Dict, Optional
 from datetime import datetime
-from .config import SYSTEM_PROMPT_FILE
+from .config import SYSTEM_PROMPT_FILE, DEBUG_MODE, MAX_SIMILAR_EXAMPLES
 from .db import ConversationDB
 
 logger = logging.getLogger(__name__)
@@ -40,54 +40,59 @@ async def get_base_system_prompt() -> str:
 
 async def get_system_prompt(user_message: Optional[str] = None) -> str:
     """
-    Get the system prompt with dynamically included similar examples.
-    Shows which examples are being used in the console.
-    
-    Args:
-        user_message: Optional current user message to find similar examples for
-    
-    Returns:
-        Complete system prompt including relevant examples
+    Get the system prompt with optional similar examples included.
     """
-    # Get the base system prompt
-    base_prompt = await get_base_system_prompt()
+    start_time = datetime.now()
     
-    # If no user message, return just the base prompt
-    if not user_message:
+    # Load base prompt
+    base_prompt = await get_base_system_prompt()
+    if DEBUG_MODE:
+        base_time = (datetime.now() - start_time).total_seconds()
+        print("│  ⏱  Base: {:.2f}s".format(base_time))
+    
+    if not user_message or MAX_SIMILAR_EXAMPLES == 0:
         return base_prompt
         
-    try:
-        # Get similar examples from the database
-        db = ConversationDB()
-        similar_exchanges = db.find_successful_exchange(user_message)
-        
-        if not similar_exchanges:
-            print("\n[Context] Warning: No exchanges found in database. This should not happen if database is populated.")
-            return base_prompt
-            
-        # Build example section and show what's being used
-        print("\n[Context] Including similar examples:")
-        examples = "\n\nHere are some example interactions to guide your responses:"
-        for stored_prompt, stored_response, ratio in similar_exchanges:
-            similarity_desc = "Excellent" if ratio >= 0.9 else "Good" if ratio >= 0.7 else "Partial" if ratio >= 0.5 else "Low"
-            print(f"• {similarity_desc} match ({ratio:.2%}): '{stored_prompt}' -> '{stored_response}'")
-            examples += f"\n\nUser: {stored_prompt}\nAssistant: {stored_response}"
-        
-        # Combine base prompt with examples
-        complete_prompt = base_prompt + examples
-        
-        # Show the complete prompt that will be sent to the model
-        print("\n[Context] Complete system prompt being sent to model:")
-        print("-" * 80)
-        print(complete_prompt)
-        print("-" * 80)
-        
-        return complete_prompt
-        
-    except Exception as e:
-        logger.error(f"Error adding similar examples to prompt: {e}")
-        print("\n[Context] Error retrieving similar examples:", str(e))
+    # Find similar examples
+    db = ConversationDB()
+    similar_start = datetime.now()
+    similar_exchanges = db.find_successful_exchange(user_message)
+    
+    if DEBUG_MODE:
+        similar_time = (datetime.now() - similar_start).total_seconds()
+        print("│  ⏱  Similar: {:.2f}s".format(similar_time))
+    
+    if not similar_exchanges:
         return base_prompt
-    finally:
-        if 'db' in locals():
-            db.close()
+        
+    # Format examples
+    format_start = datetime.now()
+    examples = []
+    for i, (query, response, similarity) in enumerate(similar_exchanges[:MAX_SIMILAR_EXAMPLES], 1):
+        if similarity >= 0.5:  # Only include somewhat relevant examples
+            match_type = "Exact match" if similarity == 1.0 else (
+                        "Good match" if similarity >= 0.8 else 
+                        "Partial match")
+            if DEBUG_MODE:
+                print(f"│  • {match_type} ({similarity:.1%}): '{query}' -> '{response[:60]}...'")
+            examples.append(f"""
+Example (semantically similar user request (score: {similarity:.2%})):
+
+User: {query}
+Assistant: {response}""")
+    
+    if DEBUG_MODE:
+        format_time = (datetime.now() - format_start).total_seconds()
+        print("│  ⏱  Format: {:.2f}s".format(format_time))
+    
+    # Combine prompts
+    combine_start = datetime.now()
+    final_prompt = base_prompt + "\n".join(examples)
+    
+    if DEBUG_MODE:
+        combine_time = (datetime.now() - combine_start).total_seconds()
+        total_time = (datetime.now() - start_time).total_seconds()
+        print("│  ⏱  Combine: {:.2f}s".format(combine_time))
+        print("│  ⏱  Total: {:.2f}s".format(total_time))
+    
+    return final_prompt

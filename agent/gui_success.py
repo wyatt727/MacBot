@@ -26,7 +26,7 @@ from PySide6.QtCore import Qt, QTimer
 from agent.db import ConversationDB
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 class EditResponseDialog(QDialog):
     def __init__(self, exchange_id, user_prompt, current_response, parent=None):
