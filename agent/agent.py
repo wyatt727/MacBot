@@ -471,7 +471,8 @@ class MinimalAIAgent:
                         self.model, 
                         self.aiohttp_session,
                         num_thread=self.ollama_config["num_thread"],
-                        num_gpu=self.ollama_config["num_gpu"]
+                        num_gpu=self.ollama_config["num_gpu"],
+                        timeout=self.ollama_config["timeout"]
                     )
                 llm_time = (datetime.now() - llm_start).total_seconds()
                 

@@ -4,7 +4,7 @@ import asyncio
 import logging
 import json
 from .config import OLLAMA_API_BASE
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +13,8 @@ async def get_llm_response_async(
     model: str, 
     session: aiohttp.ClientSession,
     num_thread: int = 4,
-    num_gpu: int = 0
+    num_gpu: int = 0,
+    timeout: Optional[int] = None
 ) -> str:
     """
     Get a response from the LLM using Ollama's API with optimized settings.
@@ -24,6 +25,7 @@ async def get_llm_response_async(
         session: aiohttp ClientSession for making requests
         num_thread: Number of CPU threads to use (default: 4)
         num_gpu: Number of GPU layers to use (default: 0)
+        timeout: Request timeout in seconds (default: None, uses session timeout)
     
     Returns:
         The model's response text
@@ -49,7 +51,10 @@ async def get_llm_response_async(
         start_time = None
         
         try:
-            async with session.post(url, json=request_data) as response:
+            # Create a new timeout for this specific request if specified
+            request_timeout = aiohttp.ClientTimeout(total=timeout) if timeout is not None else None
+            
+            async with session.post(url, json=request_data, timeout=request_timeout) as response:
                 if response.status != 200:
                     error_text = await response.text()
                     raise RuntimeError(
