@@ -22,12 +22,20 @@ async def execute_code_async(language: str, code: str, timeout: int = 300) -> (i
     Asynchronously execute a code block.
     Uses aiofiles for file I/O and asyncio.create_subprocess_exec for subprocess management.
     """
-    os.makedirs(GENERATED_CODE_DIR, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    ext = ".py" if language == "python" else ".sh"
-    filename = os.path.join(GENERATED_CODE_DIR, f"generated_{timestamp}{ext}")
-    async with aiofiles.open(filename, "w", encoding="utf-8") as f:
-        await f.write(code.strip() + "\n")
+    if SAVE_CODE_BLOCKS:
+        os.makedirs(GENERATED_CODE_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ext = ".py" if language == "python" else ".sh"
+        filename = os.path.join(GENERATED_CODE_DIR, f"generated_{timestamp}{ext}")
+        async with aiofiles.open(filename, "w", encoding="utf-8") as f:
+            await f.write(code.strip() + "\n")
+    else:
+        # Create a temporary file that will be automatically cleaned up
+        import tempfile
+        ext = ".py" if language == "python" else ".sh"
+        with tempfile.NamedTemporaryFile(mode='w', suffix=ext, delete=False) as temp_file:
+            temp_file.write(code.strip() + "\n")
+            filename = temp_file.name
     
     if language == "python":
         cmd = [os.sys.executable, filename]
@@ -46,6 +54,20 @@ async def execute_code_async(language: str, code: str, timeout: int = 300) -> (i
             proc.kill()
             return -1, f"[{language.capitalize()} Error] Execution timed out after {timeout} seconds."
         output = (stdout.decode() + stderr.decode()).strip()
+        
+        # Clean up temporary file if not saving code blocks
+        if not SAVE_CODE_BLOCKS:
+            try:
+                os.unlink(filename)
+            except OSError:
+                pass
+                
         return proc.returncode, output
     except Exception as e:
+        # Clean up temporary file if not saving code blocks
+        if not SAVE_CODE_BLOCKS:
+            try:
+                os.unlink(filename)
+            except OSError:
+                pass
         return -1, f"[{language.capitalize()} Error] Exception: {e}"
