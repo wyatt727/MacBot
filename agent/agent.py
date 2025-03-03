@@ -15,11 +15,23 @@ from .code_executor import execute_code_async
 from .config import (
     LLM_MODEL, MAX_CONCURRENT_LLM_CALLS, 
     MAX_CONCURRENT_CODE_EXECUTIONS, RESPONSE_TIMEOUT,
-    SIMILARITY_THRESHOLD, DEBUG_MODE
+    SIMILARITY_THRESHOLD, DEBUG_MODE, SAVE_CODE_BLOCKS
 )
+import json
+import urllib.parse
+import html
+import re
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import functools
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# Create a search cache
+_SEARCH_CACHE = {}  # Query hash -> (results, timestamp)
+_SEARCH_CACHE_TTL = 3600  # 1 hour cache TTL
+_BACKGROUND_TASKS = set()  # Keep track of background tasks
 
 class CommandHistory:
     """Manages command history with persistence and navigation."""
@@ -89,17 +101,40 @@ class MinimalAIAgent:
       - An example interaction from the success DB (if the best match is at least 80% similar).
       - The current user query.
     This context is then sent to the LLM.
+    
+    Features:
+    - Web search integration for up-to-date information
+    - Command history with navigation
+    - Model switching at runtime
+    - Performance metrics and diagnostics
+    - Conversation history management
     """
-    def __init__(self, model: str = LLM_MODEL, command_timeout: int = 60):
+    def __init__(self, 
+                 model: str = LLM_MODEL, 
+                 timeout: int = RESPONSE_TIMEOUT,
+                 max_llm_calls: int = MAX_CONCURRENT_LLM_CALLS,
+                 max_code_execs: int = MAX_CONCURRENT_CODE_EXECUTIONS,
+                 debug_mode: bool = DEBUG_MODE,
+                 save_code: bool = SAVE_CODE_BLOCKS,
+                 command_timeout: int = 60):
         self.model = model
         self.db = ConversationDB()
         self.last_user_query = self.db.get_setting("last_user_query") or ""
+        
+        # Store the timeout value
+        self.default_timeout = timeout
         self.aiohttp_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=RESPONSE_TIMEOUT)
+            timeout=aiohttp.ClientTimeout(total=timeout)
         )
+        
+        # Apply configuration settings
+        global DEBUG_MODE, SAVE_CODE_BLOCKS
+        DEBUG_MODE = debug_mode
+        SAVE_CODE_BLOCKS = save_code
+        
         # Optimized semaphores
-        self.llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
-        self.code_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CODE_EXECUTIONS)
+        self.llm_semaphore = asyncio.Semaphore(max_llm_calls)
+        self.code_semaphore = asyncio.Semaphore(max_code_execs)
         self.command_history = CommandHistory()
         self.session_start = datetime.now()
         self.in_comparison_mode = self.db.get_setting("in_comparison_mode") == "true"
@@ -107,75 +142,306 @@ class MinimalAIAgent:
         # Ollama-specific optimizations
         self.ollama_config = {
             "num_thread": os.cpu_count() or 4,  # Default to CPU count or 4
-            "num_gpu": 0,  # Default to CPU-only mode
-            "timeout": RESPONSE_TIMEOUT
+            "num_gpu": 0,  # Initialize to 0, will be set below
+            "timeout": timeout
         }
         
-        # Load Ollama config from environment or settings
+        # Auto-detect GPU capabilities
+        auto_gpu_layers = self._detect_gpu_capabilities()
+        if auto_gpu_layers > 0:
+            logger.info(f"Auto-detected GPU capabilities: recommended {auto_gpu_layers} layers")
+            
+        # Load Ollama config from environment, settings, or auto-detection
         if os.getenv("OLLAMA_NUM_THREAD"):
             self.ollama_config["num_thread"] = int(os.getenv("OLLAMA_NUM_THREAD"))
+        elif self.db.get_setting("ollama_num_thread"):
+            try:
+                self.ollama_config["num_thread"] = int(self.db.get_setting("ollama_num_thread"))
+            except (ValueError, TypeError):
+                pass  # Use default if invalid
+                
         if os.getenv("OLLAMA_NUM_GPU"):
             self.ollama_config["num_gpu"] = int(os.getenv("OLLAMA_NUM_GPU"))
+        elif self.db.get_setting("ollama_num_gpu"):
+            try:
+                self.ollama_config["num_gpu"] = int(self.db.get_setting("ollama_num_gpu"))
+            except (ValueError, TypeError):
+                # Use auto-detected GPU if available
+                self.ollama_config["num_gpu"] = auto_gpu_layers
+        else:
+            # No environment or DB setting, use auto-detected GPU
+            self.ollama_config["num_gpu"] = auto_gpu_layers
         
-        # Store default timeout for restoration after /notimeout
-        self.default_timeout = RESPONSE_TIMEOUT
-        
-        # Performance tracking
-        self.performance_metrics = {
-            "llm_calls": 0,
+        # Performance metrics
+        self.perf_metrics = {
+            "avg_response_time": 0,
+            "total_response_time": 0,
+            "total_tokens": 0,
+            "requests_count": 0,
+            "tokens_per_second": 0,
             "cache_hits": 0,
-            "total_llm_time": 0,
-            "avg_llm_time": 0,
             "timeouts": 0
         }
         
+        # Store default timeout for restoration after /notimeout
+        self.default_timeout = timeout
+        
         # Initialize command aliases and shortcuts
         self.command_aliases = {
-            '/h': self.show_help,
-            '/help': self.show_help,
-            '/history': self.show_command_history,
-            '/clear': self.clear_screen,
-            '/stats': self.show_session_stats,
-            '/repeat': self.repeat_last_command,
-            '/success': self.process_success_command,
-            '/compare': self.compare_models_command,
-            '/nocache': lambda x: x.replace('/nocache ', ''),
-            '/notimeout': lambda x: x.replace('/notimeout ', ''),
-            '/perf': self.show_performance_metrics
+            'h': self.show_help,
+            'help': self.show_help,
+            'history': self.show_command_history,
+            'clear': self.clear_screen,
+            'stats': self.show_session_stats,
+            'repeat': self.repeat_last_command,
+            'success': self.process_success_command,
+            'compare': self.compare_models_command,
+            'search': lambda x: self.web_search(x) if x else "Please provide a search query",
+            'web': lambda x: self.web_search(x) if x else "Please provide a search query",
+            'perf': self.show_performance_metrics,
+            'model': self.set_model,
+            'exit': lambda _: "exit",
+            'quit': lambda _: "exit",
+            'bye': lambda _: "exit",
+            'threads': self.set_threads,
+            'gpu': self.set_gpu_layers
         }
 
-    async def show_help(self, _: str):
-        """Show help information about available commands."""
-        help_text = """
-╭─ Available Commands ─────────────────────────────────────────────
+    async def show_help(self, args: str = ""):
+        """
+        Display help information for using the agent.
+        
+        Args:
+            args: Optional specific command to get help on
+        """
+        if args:
+            # Show help for a specific command
+            cmd = args.lower().strip().split()[0] if args.split() else ""
+            if cmd in ["search", "web"]:
+                return """
+╭─ Web Search Help ─────────────────────────────────────────
 │
-│  Navigation
-│  • Up/Down Arrow : Browse history
-│  • Ctrl+R       : Search history
-│  • Tab          : Auto-complete
+│  SEARCH COMMANDS:
+│  • /search [query]  - Search Wikipedia for information
+│  • /web [query]     - Alias for /search
+│  • ?[query]         - Quick search shortcut (same as /search)
+│  • ?![query]        - TURBO search (ultra-fast, fewer results)
 │
-│  Basic Commands
-│  • /h, /help    : Show this help
-│  • /clear       : Clear screen
-│  • /history     : Show history
-│  • /stats       : Show statistics
-│  • /repeat      : Repeat last command
-│  • /perf        : Show performance
+│  NOTE: Web search is limited to Wikipedia in this local environment.
 │
-│  Advanced
-│  • /success     : Manage exchanges
-│  • /compare     : Compare models
-│  • /nocache     : Skip cache
-│  • /notimeout   : Disable timeout
-│  • exit, /bye   : Exit MacBot
+│  Examples:
+│    /search python programming
+│    ?artificial intelligence
 │
-│  Tips
-│  • Commands are saved between sessions
-│  • Use Tab for quick completion
-│  • Ctrl+C to cancel operations
+╰──────────────────────────────────────────────────────────"""
+            
+            elif cmd == "history":
+                return """
+╭─ History Command Help ────────────────────────────────────
 │
-╰──────────────────────────────────────────────────────────────────"""
-        print(help_text)
+│  Usage: /history [subcommand] [arguments]
+│
+│  Subcommands:
+│  • (none)       - Show most recent conversation history
+│  • search [term] - Search conversation history for a term
+│  • clear        - Clear all conversation history (requires confirmation)
+│  • save [file]  - Save conversation history to a file
+│
+│  Examples:
+│    /history
+│    /history search python
+│    /history clear
+│    /history save my_conversation.txt
+│
+╰──────────────────────────────────────────────────────────"""
+            
+            elif cmd == "model":
+                return """
+╭─ Model Command Help ───────────────────────────────────────
+│
+│  Usage: /model [model_name]
+│
+│  Without arguments, shows the current model being used.
+│  With a model name, switches to using that model for responses.
+│
+│  Example: /model llama3:8b
+│
+╰───────────────────────────────────────────────────────────"""
+            
+            elif cmd == "perf":
+                return """
+╭─ Performance Metrics Help ─────────────────────────────────
+│
+│  Usage: /perf
+│
+│  Displays detailed performance metrics including:
+│  • LLM Statistics (calls, cache hits, response times)
+│  • Ollama Configuration (CPU threads, GPU layers)
+│
+│  Related commands:
+│  • /threads - Change CPU thread count
+│  • /gpu     - Change GPU layer count
+│
+╰───────────────────────────────────────────────────────────"""
+            
+            elif cmd == "notimeout":
+                return """
+╭─ No Timeout Command Help ─────────────────────────────────
+│
+│  Usage: /notimeout [your query]
+│
+│  Disables the response timeout for this specific query.
+│  Useful for complex tasks that may take longer to process.
+│
+│  Example: /notimeout lets play a game of chess
+│
+╰───────────────────────────────────────────────────────────"""
+            
+            elif cmd == "nocache":
+                return """
+╭─ No Cache Command Help ──────────────────────────────────
+│
+│  Usage: /nocache [your query]
+│
+│  Bypasses the response cache and forces a new LLM response.
+│  Useful when you want a fresh answer ignoring cached results.
+│
+│  Example: /nocache what's the current time?
+│
+╰──────────────────────────────────────────────────────────"""
+                
+            elif cmd == "clear":
+                return """
+╭─ Clear Command Help ──────────────────────────────────────
+│
+│  Usage: /clear
+│
+│  Clears the terminal screen.
+│  This command has no arguments.
+│
+╰──────────────────────────────────────────────────────────"""
+                
+            elif cmd == "stats":
+                return """
+╭─ Stats Command Help ───────────────────────────────────────
+│
+│  Usage: /stats
+│
+│  Displays session statistics including:
+│  • Commands executed
+│  • Session duration
+│  • Memory usage
+│
+╰───────────────────────────────────────────────────────────"""
+                
+            elif cmd == "repeat":
+                return """
+╭─ Repeat Command Help ───────────────────────────────────────
+│
+│  Usage: /repeat
+│
+│  Repeats the last command or query.
+│  This command has no arguments.
+│
+╰───────────────────────────────────────────────────────────"""
+                
+            elif cmd == "success":
+                return """
+╭─ Success Command Help ──────────────────────────────────────
+│
+│  Usage: /success
+│
+│  Launches the GUI for managing successful exchanges.
+│  This command has no arguments.
+│
+╰───────────────────────────────────────────────────────────"""
+                
+            elif cmd == "compare":
+                return """
+╭─ Compare Command Help ──────────────────────────────────────
+│
+│  Usage: /compare [prompt]
+│
+│  Compares responses from different models for the same prompt.
+│  If no prompt is provided, uses the last query.
+│
+│  Example: /compare explain quantum computing
+│
+╰───────────────────────────────────────────────────────────"""
+            
+            elif cmd == "threads":
+                return """
+╭─ CPU Threads Help ───────────────────────────────────────
+│
+│  Usage: /threads [number]
+│
+│  Change the number of CPU threads used by Ollama for inference.
+│  Higher values may improve performance but use more resources.
+│
+│  Examples:
+│    /threads          - Show current thread count
+│    /threads 8        - Set to use 8 threads
+│    /threads 16       - Set to use 16 threads
+│
+│  NOTE: Changes apply to future LLM requests only.
+│
+╰──────────────────────────────────────────────────────────"""
+            
+            elif cmd == "gpu":
+                return """
+╭─ GPU Layers Help ───────────────────────────────────────
+│
+│  Usage: /gpu [number]
+│
+│  Change the number of GPU layers used by Ollama for inference.
+│  Higher values may improve performance but use more resources.
+│
+│  Examples:
+│    /gpu          - Show current GPU layer count
+│    /gpu 8        - Set to use 8 layers
+│    /gpu 16       - Set to use 16 layers
+│
+│  NOTE: Changes apply to future LLM requests only.
+│
+╰──────────────────────────────────────────────────────────"""
+            
+            else:
+                return f"No help available for '{cmd}'. Use /help to see all commands."
+        
+        # General help
+        return """
+╭─ MacBot AI Agent Help ───────────────────────────────────────
+│
+│  Command Reference:
+│
+│  Web Integration:
+│    /search [query] - Search Wikipedia for information
+│    /web [query]    - Alias for /search
+│    ?[query]        - Quick search shortcut 
+│    ?![query]       - TURBO search (ultra-fast)
+│
+│  Model & Performance:
+│    /model [name]   - View or change LLM model
+│    /threads [num]  - View or change CPU thread count
+│    /gpu [num]      - View or change GPU layer count
+│    /perf           - Show performance metrics
+│
+│  Session Management:
+│    /clear          - Clear the screen
+│    /stats          - Show session statistics
+│    /repeat         - Repeat last command
+│
+│  Options:
+│    /nocache        - Skip cache for next query
+│    /notimeout      - Disable timeout for next query
+│
+│  General:
+│    /help [command] - Show help for all or specific command
+│    /exit or /quit  - Exit the application
+│
+│  Tip: Use Tab for command completion!
+│
+╰───────────────────────────────────────────────────────────"""
 
     async def show_command_history(self, _: str):
         """Show the command history with timestamps."""
@@ -222,8 +488,8 @@ class MinimalAIAgent:
 │  ⏱  Duration    : {" ".join(duration_str)}
 │  ⌨️  Commands    : {total_commands}
 │  ✓  Successful  : {successful}
-│  🔄 Cache Hits  : {self.performance_metrics['cache_hits']}
-│  ⚡ LLM Calls   : {self.performance_metrics['llm_calls']}
+│  🔄 Cache Hits  : {self.perf_metrics['requests_count'] - self.perf_metrics['requests_count']}
+│  ⚡ LLM Calls   : {self.perf_metrics['requests_count']}
 │
 ╰──────────────────────────────────────────────────────────"""
         print(stats)
@@ -343,6 +609,10 @@ class MinimalAIAgent:
                     print("│  Result:")
                     for line in output.strip().split('\n'):
                         print(f"│  {line}")
+                else:
+                    print("│")
+                    print("│  No output")
+                    
                 if DEBUG_MODE:
                     print(f"│  Time: {exec_time:.2f}s")
             print("│")
@@ -350,9 +620,10 @@ class MinimalAIAgent:
         if blocks:
             if DEBUG_MODE:
                 total_time = (datetime.now() - start_time).total_seconds()
-                print(f"└─ Total time: {total_time:.2f}s")
+                print(f"└─ Total execution time: {total_time:.2f}s")
             else:
-                print("└" + "─" * 60)
+                print("└" + "─" * 64)
+        
         return results
 
     async def show_performance_metrics(self, _: str):
@@ -361,31 +632,47 @@ class MinimalAIAgent:
 ╭─ Performance Metrics ──────────────────────────────────────
 │
 │  LLM Statistics
-│  • Total Calls : {self.performance_metrics['llm_calls']}
-│  • Cache Hits  : {self.performance_metrics['cache_hits']}"""
+│  • Total Calls : {self.perf_metrics['requests_count']}
+│  • Cache Hits  : {self.perf_metrics['cache_hits']}"""
 
-        if self.performance_metrics['llm_calls'] > 0:
+        if self.perf_metrics['requests_count'] > 0:
             metrics += f"""
-│  • Avg Time    : {self.performance_metrics['avg_llm_time']:.1f}s
-│  • Total Time  : {self.performance_metrics['total_llm_time']:.1f}s"""
+│  • Avg Time    : {self.perf_metrics['avg_response_time']:.1f}s
+│  • Total Time  : {self.perf_metrics['total_response_time']:.1f}s"""
 
         metrics += f"""
-│  • Timeouts    : {self.performance_metrics['timeouts']}
+│  • Timeouts    : {self.perf_metrics['timeouts']}
 │
 │  Ollama Configuration
 │  • CPU Threads : {self.ollama_config['num_thread']}
 │  • GPU Layers  : {self.ollama_config['num_gpu']}
 │
 ╰──────────────────────────────────────────────────────────"""
-        print(metrics)
+        
+        # Return the metrics string instead of printing it
+        return metrics
 
     async def process_message(self, message: str, no_cache: bool = False) -> Tuple[str, bool]:
         """
-        Optimized message processing using only SQLite for caching.
+        Process user message and return a response.
         Returns: Tuple[response: str, was_cached: bool]
         """
         start_time = datetime.now()
         phase = "initialization"
+        
+        # Store for command completion context
+        self.current_input = message
+        
+        # Turbo search mode with ?! prefix (ultra-fast search)
+        if message.startswith('?!'):
+            search_query = message[2:].strip()
+            return await self._turbo_search(search_query), False
+        
+        # Standard quick search with ? prefix
+        elif message.startswith('?'):
+            search_query = message[1:].strip()
+            search_results = await self.web_search(search_query)
+            return search_results, False
         
         # Check for /notimeout flag
         use_extended_timeout = False
@@ -400,7 +687,33 @@ class MinimalAIAgent:
             self.aiohttp_session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=0)  # 0 means no timeout
             )
+        
+        # Extract command if message starts with /
+        command, args = self._extract_command_and_args(message)
+        if command:
+            # Handle direct command aliases (functions that return values)
+            if command in ['search', 'web']:
+                search_results = await self.web_search(args)
+                return search_results, False
             
+            # Handle built-in commands
+            if command == "history":
+                history_response = await self._handle_history_command(command, args)
+                if history_response:
+                    return history_response, False
+            
+            # Handle model switching
+            if command == "model":
+                if not args:
+                    return f"Current model: {self.model}\nUse /model [model_name] to switch models", False
+                self.model = args
+                return f"Model switched to {self.model}", False
+            
+            # Handle performance command
+            if command == "perf":
+                await self.show_performance_metrics(args)
+                return "Performance metrics displayed above", False
+        
         try:
             if not no_cache:
                 phase = "database_lookup"
@@ -426,12 +739,15 @@ class MinimalAIAgent:
                         
                         print("╰──────────────────────────────────────────────────────")
                         
-                        self.performance_metrics["cache_hits"] += 1
+                        self.perf_metrics["requests_count"] += 1
+                        self.perf_metrics["cache_hits"] += 1
                         cached_response = best_match[1]
                         
                         blocks = self.extract_code_from_response(cached_response)
                         if blocks:
                             results = await self._process_code_blocks_parallel(blocks)
+                            # Return an empty string to avoid duplicating the code output
+                            return "", True
                         
                         return cached_response, True
             
@@ -446,10 +762,7 @@ class MinimalAIAgent:
                 if similarity >= 0.5:  # Only show if somewhat relevant
                     print("│")
                     print("│  Similar examples found:")
-                    for query, response, sim in similar_exchanges[:3]:  # Show top 3
-                        match_type = "Excellent" if sim >= 0.9 else "Good" if sim >= 0.7 else "Partial"
-                        preview = response.split('\n')[0][:50] + "..." if len(response) > 50 else response
-                        print(f"│  • {match_type} ({sim:.1%}): '{query}' → '{preview}'")
+                    print(f"│  • {similarity*100:.1f}%: '{best_match[0]}' → '{best_match[1][:50]}...'")
                     print("│")
                     print("│  ℹ️  Using examples for context but generating new response")
                     print("│     (similarity below cache threshold)")
@@ -457,7 +770,7 @@ class MinimalAIAgent:
             if DEBUG_MODE:
                 context_start = datetime.now()
             
-            context = await self._build_context(message, no_cache=no_cache)
+            context = await self._build_context(message, no_cache)
             
             if DEBUG_MODE:
                 context_time = (datetime.now() - context_start).total_seconds()
@@ -477,11 +790,12 @@ class MinimalAIAgent:
                 llm_time = (datetime.now() - llm_start).total_seconds()
                 
                 # Update performance metrics
-                self.performance_metrics["llm_calls"] += 1
-                self.performance_metrics["total_llm_time"] += llm_time
-                self.performance_metrics["avg_llm_time"] = (
-                    self.performance_metrics["total_llm_time"] / 
-                    self.performance_metrics["llm_calls"]
+                self.perf_metrics["requests_count"] += 1
+                self.perf_metrics["total_response_time"] += llm_time
+                self.perf_metrics["total_tokens"] += llm_time
+                self.perf_metrics["avg_response_time"] = (
+                    self.perf_metrics["total_response_time"] / 
+                    self.perf_metrics["requests_count"]
                 )
                 
                 if llm_time > 10:
@@ -490,8 +804,9 @@ class MinimalAIAgent:
                     print(f"│  ⏱  LLM: {llm_time:.1f}s")
                     
             except asyncio.TimeoutError:
-                self.performance_metrics["timeouts"] += 1
-                raise TimeoutError(f"Response timed out after {RESPONSE_TIMEOUT}s")
+                self.perf_metrics["requests_count"] += 1
+                self.perf_metrics["timeouts"] += 1
+                raise TimeoutError(f"Response timed out after {self.ollama_config['timeout']}s")
             except Exception as e:
                 logger.error(f"LLM response error: {str(e)}")
                 print("│")
@@ -524,6 +839,8 @@ class MinimalAIAgent:
             # Execute code blocks immediately for non-cached responses
             if blocks:
                 await self._process_code_blocks_parallel(blocks)
+                # Return an empty string to avoid duplicating code blocks
+                return "", False
             
             return response, False
 
@@ -640,22 +957,377 @@ Examples:
             print(f"│  ❌ Error: {e}")
             print("╰────────────────────────────────────────────────────────")
 
-    async def run(self):
-        """Enhanced main loop with optimized processing."""
-        print("""
-╭─ MacBot AI Agent ─────────────────────────────────────────────
-│
-│  Welcome! Type /h for help, or just start chatting.
-│  Use arrow keys ↑↓ to browse history, Tab for completion.
-│
-╰──────────────────────────────────────────────────────────────""")
+    async def web_search(self, query: str, num_results: int = 5, fast_mode: bool = True) -> str:
+        """
+        Web search with fallback for limited local environments.
         
+        Features:
+        - Result caching with TTL
+        - Wikipedia search as primary source
+        - Smart error handling
+        - Graceful degradation
+        
+        Args:
+            query: Search query
+            num_results: Max results to return
+            fast_mode: Use speed optimizations
+            
+        Returns:
+            Formatted search results or advisory message
+        """
+        # Start timing
+        start_time = datetime.now()
+        
+        if not query:
+            return "Please provide a search query."
+        
+        # Clean and normalize query
+        query = query.strip()
+        search_hash = hashlib.md5(query.lower().encode()).hexdigest()
+        
+        # Check cache for recent results
+        if search_hash in _SEARCH_CACHE:
+            cached_results, timestamp = _SEARCH_CACHE[search_hash]
+            if datetime.now() - timestamp < timedelta(seconds=_SEARCH_CACHE_TTL):
+                elapsed = (datetime.now() - start_time).total_seconds()
+                return f"🚀 Results for '{query}' (cached in {elapsed:.2f}s):\n\n{cached_results}"
+        
+        print(f"🔍 Searching for: {query}")
+        
+        try:
+            # Only use Wikipedia as it's more reliable
+            wiki_results = await self._search_wikipedia(query, num_results)
+            
+            if not wiki_results:
+                return f"""
+╭─ Web Search Limited ───────────────────────────────────────
+│
+│  No results found for: "{query}"
+│
+│  Note: Web search capabilities are limited in this local environment.
+│  For complex searches, consider:
+│  • Using more specific keywords
+│  • Asking the assistant directly about general knowledge topics
+│  • Using a full web browser for detailed research
+│
+╰───────────────────────────────────────────────────────────"""
+            
+            # Format results
+            formatted_results = ""
+            for i, result in enumerate(wiki_results, 1):
+                title = result.get('title', 'No title')
+                link = result.get('link', 'No link')
+                snippet = result.get('snippet', 'No description')
+                
+                formatted_results += f"{i}. {title}\n"
+                formatted_results += f"   🔗 {link}\n"
+                formatted_results += f"   {snippet}\n\n"
+            
+            # Cache the results
+            _SEARCH_CACHE[search_hash] = (formatted_results, datetime.now())
+            
+            # Return results with timing info
+            elapsed = (datetime.now() - start_time).total_seconds()
+            return f"""
+╭─ Wikipedia Search Results ({elapsed:.2f}s) ──────────────────────
+│
+│  Results for: "{query}"
+│
+{formatted_results}│
+│  Note: Web search capabilities are limited to Wikipedia in this environment.
+│
+╰───────────────────────────────────────────────────────────"""
+            
+        except Exception as e:
+            logger.error(f"Web search error: {e}")
+            return f"""
+╭─ Web Search Limited ───────────────────────────────────────
+│
+│  Unable to search for: "{query}"
+│
+│  The web search feature has limited functionality in this local environment.
+│  Error: {str(e)}
+│
+│  For general knowledge questions, try asking the assistant directly.
+│  For up-to-date information, using a full web browser is recommended.
+│
+╰───────────────────────────────────────────────────────────"""
+
+    async def _search_wikipedia(self, query: str, num_results: int = 5) -> List[Dict]:
+        """Search Wikipedia using its API."""
+        try:
+            encoded_query = urllib.parse.quote(query)
+            url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={encoded_query}&format=json&utf8=1&srlimit={num_results}"
+            
+            async with self.aiohttp_session.get(url, timeout=5) as response:
+                if response.status != 200:
+                    logger.error(f"Wikipedia API error: {response.status}")
+                    return []
+                
+                data = await response.json()
+                results = []
+                
+                for item in data.get('query', {}).get('search', []):
+                    title = html.unescape(item.get('title', ''))
+                    snippet = html.unescape(re.sub(r'<.*?>', '', item.get('snippet', '')))
+                    url = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+                    results.append({
+                        'title': title,
+                        'link': url,
+                        'snippet': snippet,
+                        'source': 'wikipedia'
+                    })
+                return results
+                
+        except Exception as e:
+            logger.error(f"Wikipedia search error: {e}")
+            return []
+
+    async def _turbo_search(self, query: str, num_results: int = 3) -> str:
+        """
+        Simplified turbo search that works with limited resources.
+        Just uses Wikipedia with fewer results for speed.
+        """
+        if not query:
+            return "Please provide a search query."
+            
+        try:
+            print(f"⚡ TURBO searching for: {query}")
+            return await self.web_search(query, num_results=num_results, fast_mode=True)
+        except Exception as e:
+            logger.error(f"Turbo search error: {e}")
+            return f"""
+╭─ Turbo Search Limited ───────────────────────────────────
+│
+│  Unable to perform turbo search for: "{query}"
+│  Error: {str(e)}
+│
+│  Try asking your question directly to the assistant instead.
+│
+╰─────────────────────────────────────────────────────────"""
+
+    async def set_model(self, model_name: str) -> str:
+        """Set the LLM model to use."""
+        if not model_name.strip():
+            return f"Current model: {self.model}"
+        
+        # Trim whitespace and validate
+        new_model = model_name.strip()
+        
+        # Store the original model in case we need to revert
+        original_model = self.model
+        
+        try:
+            # Set the new model
+            self.model = new_model
+            
+            # Build a minimal test context
+            test_context = [{"role": "user", "content": "test"}]
+            
+            # Try a minimal request to validate the model
+            try:
+                await get_llm_response_async(
+                    test_context,
+                    self.model,
+                    self.aiohttp_session,
+                    num_thread=self.ollama_config["num_thread"],
+                    num_gpu=self.ollama_config["num_gpu"],
+                    timeout=5  # Short timeout for testing
+                )
+                
+                # If we get here, the model is valid
+                return f"Model successfully switched to {self.model}"
+            except Exception as request_error:
+                error_message = str(request_error).lower()
+                
+                # If the error contains "model not found", try with :latest suffix
+                if "model not found" in error_message and ":" not in new_model:
+                    try:
+                        model_with_latest = f"{new_model}:latest"
+                        self.model = model_with_latest
+                        
+                        await get_llm_response_async(
+                            test_context,
+                            self.model,
+                            self.aiohttp_session,
+                            num_thread=self.ollama_config["num_thread"],
+                            num_gpu=self.ollama_config["num_gpu"],
+                            timeout=5  # Short timeout for testing
+                        )
+                        
+                        # If we get here, the model with :latest suffix is valid
+                        return f"Model successfully switched to {self.model}"
+                    except Exception as latest_error:
+                        # Both original name and with :latest suffix failed
+                        self.model = original_model
+                        raise RuntimeError(f"Model '{new_model}' and '{model_with_latest}' not found.") from latest_error
+                else:
+                    # Other error, not related to model not found
+                    raise request_error
+            
+        except Exception as e:
+            # Revert to the original model
+            self.model = original_model
+            error_message = str(e)
+            
+            if "model not found" in error_message.lower():
+                # Get available models
+                try:
+                    available_models = await self._get_available_models()
+                    models_text = ", ".join(available_models[:10])
+                    if len(available_models) > 10:
+                        models_text += f" and {len(available_models) - 10} more"
+                    
+                    return f"Error: Model '{new_model}' not found. Available models: {models_text}. Current model is still {self.model}."
+                except:
+                    return f"Error: Model '{new_model}' not found. Current model is still {self.model}."
+            else:
+                return f"Error switching model: {error_message}. Current model is still {self.model}."
+                
+    async def _get_available_models(self) -> List[str]:
+        """Get a list of available Ollama models."""
+        try:
+            # Execute ollama list command
+            process = await asyncio.create_subprocess_exec(
+                "ollama", "list",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await process.communicate()
+            
+            # Parse the output
+            output = stdout.decode().strip().split("\n")
+            
+            # Skip the header line and extract model names
+            if len(output) > 1:
+                models = []
+                for line in output[1:]:  # Skip header
+                    parts = line.split()
+                    if parts:
+                        models.append(parts[0])
+                return models
+            return []
+        except Exception as e:
+            logger.error(f"Error getting available models: {e}")
+            return []
+
+    async def set_threads(self, thread_count: str) -> str:
+        """Set the number of CPU threads for Ollama.
+        
+        Args:
+            thread_count: String containing the number of threads to use
+                          If empty, returns the current thread count
+        
+        Returns:
+            A confirmation message
+        """
+        # If no argument, return current setting
+        if not thread_count.strip():
+            return f"Current CPU thread count: {self.ollama_config['num_thread']}"
+        
+        # Try to parse the thread count
+        try:
+            new_thread_count = int(thread_count.strip())
+            if new_thread_count <= 0:
+                return f"Error: Thread count must be positive. Current count: {self.ollama_config['num_thread']}"
+                
+            # Set the new thread count
+            self.ollama_config['num_thread'] = new_thread_count
+            
+            # Save to settings DB for persistence
+            self.db.set_setting("ollama_num_thread", str(new_thread_count))
+            
+            return f"CPU thread count set to {new_thread_count}"
+        except ValueError:
+            return f"Error: '{thread_count}' is not a valid number. Current count: {self.ollama_config['num_thread']}"
+
+    def _setup_autocomplete(self):
+        """Set up command autocompletion for the agent."""
+        readline.set_completer(self._command_completer)
+        readline.parse_and_bind("tab: complete")
+        
+        # Set up known commands for autocompletion
+        self.commands = [
+            "/search", "/web", "/history", "/model", "/perf", "/notimeout", 
+            "/help", "/exit", "/quit", "/bye"
+        ]
+        
+        self.history_commands = [
+            "search", "clear", "save"
+        ]
+        
+        # Cache common shell commands
+        self._update_shell_commands()
+
+    def _update_shell_commands(self):
+        """
+        Update the list of available shell commands for tab completion.
+        Gets common shell commands from PATH.
+        """
+        try:
+            # Start with built-in commands
+            self.shell_commands = []
+            
+            # Add commands from standard directories in PATH
+            path_dirs = os.environ.get('PATH', '').split(os.pathsep)
+            for dir_path in path_dirs:
+                if os.path.exists(dir_path):
+                    self.shell_commands.extend([
+                        cmd for cmd in os.listdir(dir_path)
+                        if os.path.isfile(os.path.join(dir_path, cmd)) and 
+                        os.access(os.path.join(dir_path, cmd), os.X_OK)
+                    ])
+            
+            # Remove duplicates and sort
+            self.shell_commands = sorted(set(self.shell_commands))
+            
+        except Exception as e:
+            logger.error(f"Error updating shell commands: {e}")
+            self.shell_commands = []
+
+    def _command_completer(self, text, state):
+        """
+        Custom completer function for readline that completes:
+        1. Agent commands (starting with /)
+        2. Subcommands for known agent commands
+        3. Shell commands if not an agent command
+        """
+        # Check if we're completing an agent command
+        if text.startswith("/"):
+            options = [cmd for cmd in self.commands if cmd.startswith(text)]
+            return options[state] if state < len(options) else None
+        
+        # Check if we're completing a history subcommand
+        if self.current_input and self.current_input.startswith("/history "):
+            remaining = self.current_input[9:].lstrip()
+            if not " " in remaining:  # No subcommand argument yet
+                options = [subcmd for subcmd in self.history_commands if subcmd.startswith(text)]
+                return options[state] if state < len(options) else None
+            
+        # Default to shell command completion
+        options = [cmd for cmd in self.shell_commands if cmd.startswith(text)]
+        return options[state] if state < len(options) else None
+
+    async def run(self):
+        """Enhanced main loop with optimized processing and autocompletion."""
+        
+        # Setup command history and autocompletion
+        self.command_history.load_history()
+        self._setup_autocomplete()
+        
+        print("""
+╭─ MacBot AI Agent ──────────────────────────────────────────
+│
+│  Local Mode (CPU-optimized) - Type '/help' for commands, '/exit' to quit
+│
+╰──────────────────────────────────────────────────────────""")
+
         try:
             while True:
                 try:
                     user_input = await asyncio.to_thread(input, "\n❯ ")
                     
-                    if user_input.lower() in ("exit", "quit", "/bye"):
+                    if user_input.lower() in ("/exit", "/quit", "/bye", "exit", "quit"):
                         print("\n✓ Goodbye!")
                         break
 
@@ -666,32 +1338,53 @@ Examples:
                         else:
                             continue
 
+                    # Process flags first
                     no_cache = False
                     use_extended_timeout = False
+                    original_timeout = None
                     
-                    # Handle command flags
+                    # Handle /nocache flag
                     if user_input.startswith('/nocache '):
                         no_cache = True
                         user_input = user_input[9:].strip()
                         print("ℹ️  Cache disabled for this query")
                     
+                    # Handle /notimeout flag
                     if user_input.startswith('/notimeout '):
                         use_extended_timeout = True
                         user_input = user_input[10:].strip()
                         original_timeout = self.ollama_config["timeout"]
                         self.ollama_config["timeout"] = 0  # Disable timeout
+                        # Update aiohttp session timeout
+                        await self.aiohttp_session.close()
+                        self.aiohttp_session = aiohttp.ClientSession(
+                            timeout=aiohttp.ClientTimeout(total=0)  # 0 means no timeout
+                        )
                         print("ℹ️  Timeout disabled - will wait indefinitely for response")
                     
                     try:
+                        # Then process other commands
                         if user_input.startswith('/'):
-                            command = user_input.split()[0].lower()
+                            command, args = self._extract_command_and_args(user_input)
                             if command in self.command_aliases:
-                                if command not in ['/nocache', '/notimeout']:
-                                    result = await self.command_aliases[command](user_input)
-                                    if isinstance(result, str):
-                                        user_input = result
+                                handler = self.command_aliases[command]
+                                if callable(handler):
+                                    if asyncio.iscoroutinefunction(handler) or isinstance(handler, functools.partial) and asyncio.iscoroutinefunction(handler.func):
+                                        # Async handler
+                                        result = await handler(args)
                                     else:
+                                        # Sync handler (usually a lambda)
+                                        result = handler(args)
+                                    
+                                    if result is not None:
+                                        print(result)
                                         continue
+
+                        # Process quick search shortcuts
+                        if user_input.startswith('?!') or user_input.startswith('?'):
+                            result, _ = await self.process_message(user_input)
+                            print(result)
+                            continue
 
                         self.command_history.add_command(user_input)
                         self.db.set_setting("last_user_query", user_input)
@@ -699,14 +1392,26 @@ Examples:
 
                         response, was_cached = await self.process_message(user_input, no_cache=no_cache)
                         
-                        # Store the interaction in the database
-                        self.db.add_message("user", user_input)
-                        self.db.add_message("assistant", response)
+                        # Store the interaction in the database if not a command
+                        if not user_input.startswith('/'):
+                            self.db.add_message("user", user_input)
+                            # Only add non-empty responses to the database
+                            if response:
+                                self.db.add_message("assistant", response)
+                        
+                        # Only print response if it's not empty (empty means code block was already processed)
+                        if response:
+                            print(response)
                     
                     finally:
                         # Restore timeout if it was changed
-                        if use_extended_timeout:
+                        if use_extended_timeout and original_timeout is not None:
                             self.ollama_config["timeout"] = original_timeout
+                            # Restore aiohttp session with default timeout
+                            await self.aiohttp_session.close()
+                            self.aiohttp_session = aiohttp.ClientSession(
+                                timeout=aiohttp.ClientTimeout(total=self.default_timeout)
+                            )
 
                 except KeyboardInterrupt:
                     print("\n\n⨯ Operation cancelled")
@@ -730,6 +1435,180 @@ Examples:
         self.command_history.save_history()
         await self.aiohttp_session.close()
         self.db.close()
+
+    async def _handle_history_command(self, command: str, args: str) -> Optional[str]:
+        """
+        Handle history-related commands.
+        
+        Commands:
+        - /history - Show recent conversation history
+        - /history search [query] - Search conversation history
+        - /history clear - Clear all conversation history
+        - /history save [filename] - Save history to a file
+        
+        Args:
+            command: The command (should be 'history')
+            args: Arguments for the history command
+            
+        Returns:
+            Response message or None if command not handled
+        """
+        if command != "history":
+            return None
+        
+        if not args:
+            # Show recent history
+            messages = self.db.get_conversation_history(limit=10)
+            if not messages:
+                return "No conversation history found."
+            
+            history = "Recent Conversation History:\n\n"
+            for i, msg in enumerate(messages, 1):
+                role = msg["role"].capitalize()
+                content = msg["content"]
+                # Truncate long messages
+                if len(content) > 100:
+                    content = content[:100] + "..."
+                history += f"{i}. {role}: {content}\n\n"
+            
+            return history
+        
+        # Parse subcommands
+        parts = args.split(maxsplit=1)
+        subcommand = parts[0].lower() if parts else ""
+        subargs = parts[1] if len(parts) > 1 else ""
+        
+        if subcommand == "search":
+            if not subargs:
+                return "Please provide a search query."
+            
+            messages = self.db.search_conversation(subargs)
+            if not messages:
+                return f"No messages found matching '{subargs}'."
+            
+            results = f"Search Results for '{subargs}':\n\n"
+            for i, msg in enumerate(messages, 1):
+                role = msg["role"].capitalize()
+                content = msg["content"]
+                # Highlight the search term
+                content = content.replace(subargs, f"**{subargs}**")
+                results += f"{i}. {role}: {content[:100]}...\n\n"
+            
+            return results
+            
+        elif subcommand == "clear":
+            # Confirm before clearing
+            if subargs == "confirm":
+                self.db.clear_conversation_history()
+                return "Conversation history has been cleared."
+            else:
+                return "To confirm clearing all conversation history, use '/history clear confirm'"
+            
+        elif subcommand == "save":
+            filename = subargs or f"macbot_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            
+            try:
+                messages = self.db.get_conversation_history(limit=100)
+                with open(filename, "w") as f:
+                    f.write(f"MacBot Conversation History - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                    for msg in messages:
+                        role = msg["role"].capitalize()
+                        content = msg["content"]
+                        f.write(f"{role}: {content}\n\n")
+                    
+                return f"Conversation history saved to {filename}"
+            except Exception as e:
+                return f"Error saving conversation history: {str(e)}"
+            
+        return f"Unknown history subcommand: {subcommand}. Available: search, clear, save"
+
+    def _detect_gpu_capabilities(self) -> int:
+        """
+        Auto-detect GPU capabilities and return recommended number of GPU layers.
+        
+        For Apple Silicon:
+        - M1: ~16-24 layers recommended
+        - M2: ~24-32 layers recommended
+        - M3: ~32-48 layers recommended
+        - External GPUs: Varies by model
+        
+        Returns:
+            int: Recommended number of GPU layers (0 if no GPU detected)
+        """
+        try:
+            # Check if we're on macOS and have a GPU
+            if sys.platform != 'darwin':
+                return 0  # Non-macOS platforms default to CPU mode for now
+                
+            # Run system_profiler to get GPU information
+            process = subprocess.run(
+                ["system_profiler", "SPDisplaysDataType"], 
+                capture_output=True, 
+                text=True, 
+                timeout=5
+            )
+            
+            output = process.stdout.lower()
+            
+            # Check for Apple Silicon
+            if "apple m1" in output:
+                return 16  # Conservative default for M1
+            elif "apple m2" in output:
+                return 24  # Conservative default for M2
+            elif "apple m3" in output:
+                return 32  # Conservative default for M3
+            elif "apple" in output and "metal" in output:
+                return 16  # Other Apple Silicon, conservative default
+                
+            # Check for external GPU or Intel Mac with discrete GPU
+            if "amd" in output or "nvidia" in output or "radeon" in output:
+                return 8  # Conservative default for other GPUs
+                
+            # No recognized GPU
+            return 0
+            
+        except Exception as e:
+            logger.error(f"Error detecting GPU capabilities: {e}")
+            return 0  # Safe fallback to CPU-only mode
+
+    async def set_gpu_layers(self, gpu_count: str) -> str:
+        """Set the number of GPU layers for Ollama.
+        
+        Args:
+            gpu_count: String containing the number of GPU layers to use
+                       If empty, returns the current GPU layer count
+        
+        Returns:
+            A confirmation message
+        """
+        # If no argument, return current setting
+        if not gpu_count.strip():
+            if self.ollama_config['num_gpu'] == 0:
+                return "GPU acceleration is currently disabled. Use /gpu [number] to enable it."
+            else:
+                return f"Current GPU layer count: {self.ollama_config['num_gpu']}"
+        
+        # Try to parse the GPU count
+        try:
+            new_gpu_count = int(gpu_count.strip())
+            if new_gpu_count < 0:
+                return f"Error: GPU layer count must be non-negative. Current count: {self.ollama_config['num_gpu']}"
+                
+            # Set the new GPU count
+            old_count = self.ollama_config['num_gpu']
+            self.ollama_config['num_gpu'] = new_gpu_count
+            
+            # Save to settings DB for persistence
+            self.db.set_setting("ollama_num_gpu", str(new_gpu_count))
+            
+            if new_gpu_count == 0:
+                return "GPU acceleration disabled. Running in CPU-only mode."
+            elif old_count == 0:
+                return f"GPU acceleration enabled with {new_gpu_count} layers."
+            else:
+                return f"GPU layer count set to {new_gpu_count}"
+        except ValueError:
+            return f"Error: '{gpu_count}' is not a valid number. Current count: {self.ollama_config['num_gpu']}"
 
 if __name__ == "__main__":
     asyncio.run(MinimalAIAgent(model=LLM_MODEL).run())

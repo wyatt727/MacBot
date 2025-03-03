@@ -845,3 +845,100 @@ class ConversationDB:
             (key, value)
         )
         self.conn.commit()
+
+    def get_conversation_history(self, limit: int = 100) -> List[Dict[str, str]]:
+        """
+        Get conversation history with a specified limit.
+        
+        Args:
+            limit: Maximum number of messages to return (default 100)
+            
+        Returns:
+            List of conversation messages with role and content
+        """
+        messages = []
+        try:
+            query = """
+                SELECT role, content, timestamp 
+                FROM conversation 
+                WHERE role IN ('user', 'assistant') 
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """
+            
+            cursor = self.conn.execute(query, (limit,))
+            rows = cursor.fetchall()
+            
+            # Convert to dictionary format and reverse to chronological order
+            for role, content, timestamp in reversed(rows):
+                messages.append({
+                    "role": role,
+                    "content": content,
+                    "timestamp": timestamp
+                })
+                
+        except Exception as e:
+            logger.error(f"Error retrieving conversation history: {e}")
+            
+        return messages
+        
+    def search_conversation(self, search_term: str, limit: int = 20) -> List[Dict[str, str]]:
+        """
+        Search conversation history for a specific term.
+        
+        Args:
+            search_term: Term to search for
+            limit: Maximum number of results to return (default 20)
+            
+        Returns:
+            List of matching conversation messages
+        """
+        if not search_term:
+            return []
+            
+        results = []
+        try:
+            query = """
+                SELECT role, content, timestamp 
+                FROM conversation 
+                WHERE role IN ('user', 'assistant') 
+                AND content LIKE ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """
+            
+            # Use SQL LIKE for basic pattern matching
+            pattern = f"%{search_term}%"
+            cursor = self.conn.execute(query, (pattern, limit))
+            rows = cursor.fetchall()
+            
+            for role, content, timestamp in rows:
+                results.append({
+                    "role": role,
+                    "content": content,
+                    "timestamp": timestamp
+                })
+                
+        except Exception as e:
+            logger.error(f"Error searching conversation history: {e}")
+            
+        return results
+        
+    def clear_conversation_history(self) -> bool:
+        """
+        Clear all conversation history.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Keep any system messages but delete user and assistant messages
+            query = """
+                DELETE FROM conversation 
+                WHERE role IN ('user', 'assistant')
+            """
+            self.conn.execute(query)
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing conversation history: {e}")
+            return False

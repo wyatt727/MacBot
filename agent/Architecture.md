@@ -3,45 +3,63 @@ description: This document provides an in-depth explanation of the project archi
 globs:
 ---
 
-# Architecture Overview
+# MacBot AI Agent Architecture
 
-This document provides a detailed explanation of the MacBot AI agent project. It describes the responsibilities and interactions of each module and file in the codebase, ensuring maintainability, scalability, and responsiveness on CPU-only machines.
+This document provides an in-depth explanation of every file in the project, detailing its purpose, key features, and how it fits into the overall architecture of the MacBot AI agent.
 
 ## Project Structure Overview
 
+```
 MacBot/
 ├── agent/
 │   ├── __init__.py
-│   ├── config.py         # Global configuration and constants for the project
-│   ├── system_prompt.py  # Asynchronous reading and caching of the system prompt
-│   ├── db.py             # SQLite database interface for conversation history and caching successful exchanges
-│   ├── code_executor.py  # Asynchronous code extraction and execution routines with auto‑fix capabilities
-│   ├── llm_client.py     # Asynchronous LLM API client for fetching responses
-│   ├── model_comparator.py # Model comparison and analysis functionality
-│   ├── agent.py          # Core agent logic: conversation management, LLM invocation, caching, and code execution
-│   └── main.py           # Entry point for launching the AI agent
-├── tests/                # Unit and integration tests
-├── requirements.txt      # Python dependencies
+│   ├── config.py         # Global configuration and constants
+│   ├── system_prompt.py  # Reading and caching the system prompt
+│   ├── db.py             # SQLite database interface for conversation history and successful exchanges
+│   ├── code_executor.py  # Asynchronous code execution routines
+│   ├── llm_client.py     # Asynchronous LLM API client
+│   ├── agent.py          # Core agent logic (intent matching, auto-fix loop, cached responses)
+│   ├── main.py           # Entry point to run the agent with command line arguments
+│   └── model_comparator.py # Model comparison utilities
+├── tests/
+│   ├── __init__.py       
+│   ├── test_db.py        # Unit tests for the database layer
+│   ├── test_system_prompt.py  # Tests for system prompt reading and caching
+│   ├── test_code_executor.py  # Tests for asynchronous code execution
+│   ├── test_llm_client.py     # Tests for the LLM API client
+│   └── test_agent.py     # Tests for overall agent behavior and intent matching
+├── requirements.txt      # Python dependencies for the project
 ├── README.md             # Overview, installation, usage, and testing instructions
-└── system-prompt.txt     # System instructions for the AI agent
+└── system-prompt.txt     # File containing the system instructions
+```
 
 ## Detailed File Descriptions
 
 ### 1. `agent/config.py`
 - **Purpose:**  
-  Provides global configuration settings and constants used throughout the system.
-- **Key Settings:**  
+  Holds global configuration settings for the project.
+- **Key Features:**  
   - **System Prompt Path:**  
     Specifies the location of the `system-prompt.txt` file.
   - **LLM API Settings:**  
-    - `LLM_API_URL`: The URL for the LLM backend (by default "http://127.0.0.1:11434/api/chat").
-    - `LLM_MODEL`: The default model name (currently "deepseek-coder-v2") which determines the LLM endpoint to be used.
+    - `OLLAMA_API_BASE`: The URL for the LLM backend (by default "http://127.0.0.1:11434").
+    - `LLM_MODEL`: The default model name (currently "deepseek-coder-v2") which determines the LLM model to use.
   - **Execution Parameters:**  
     Contains settings like `MAX_FIX_ATTEMPTS` for code auto‑fix attempts and `CONTEXT_MSG_COUNT` for determining the number of context messages.
+  - **Performance Configuration:**
+    - `RESPONSE_TIMEOUT`: Default timeout for LLM requests.
+    - `MAX_CONCURRENT_LLM_CALLS`: Limits simultaneous API calls.
+    - `MAX_CONCURRENT_CODE_EXECUTIONS`: Limits parallel code executions.
   - **Storage Configuration:**  
     Paths to the SQLite database file (`conversation.db`) and the directory where generated code files are stored.
   - **Additional Options:**  
-    `SAVE_CODE_BLOCKS` allows code blocks to be permanently saved if set to True.
+    `SAVE_CODE_BLOCKS` allows code blocks to be permanently saved if set to True, otherwise uses temporary files.
+  - **Optimization Settings:**
+    - Support for configuring CPU thread count for Ollama
+    - Auto-detection of GPU capabilities on Apple Silicon and other GPU-enabled Macs
+    - Smart defaults for GPU layers based on detected hardware (M1/M2/M3)
+    - Persistent thread and GPU configuration via database
+    - Command-line interface for adjusting performance parameters
 
 ### 2. `agent/system_prompt.py`
 - **Purpose:**  
@@ -62,84 +80,139 @@ MacBot/
     - Token counts
     - Code execution results
     - Success/failure status
+  - **Conversation Management Functions:**
+    - Retrieving conversation history
+    - Searching for specific terms in conversations
+    - Clearing conversation history
+    - Saving conversations to files
   - Methods to query, insert, and match conversation data efficiently.
 
 ### 4. `agent/code_executor.py`
 - **Purpose:**  
   Handles code block extraction and asynchronous execution.
 - **Key Features:**  
-  - Uses regular expressions to extract code blocks from LLM responses.
-  - Writes code blocks to files and executes them asynchronously using subprocesses.
-  - Implements an auto‑fix mechanism that, if code execution fails, queries the LLM for corrected code and retries execution.
-  - Provides detailed logging of errors and execution results.
+  - **Code Extraction:**  
+    Contains functions to extract code blocks enclosed in triple-backtick marks.
+  - **Asynchronous Code Execution:**  
+    - When `SAVE_CODE_BLOCKS` is True: Creates persistent code files in `GENERATED_CODE_DIR`.
+    - When `SAVE_CODE_BLOCKS` is False: Uses temporary files that are deleted after execution.
+    - Uses asynchronous subprocess calls for execution with timeout handling.
+  - **Error Reporting:**  
+    Returns detailed error messages if execution fails, allowing for automated queries to fix the code.
 
-### 5. `agent/model_comparator.py`
-- **Purpose:**  
-  Implements functionality for comparing responses from different Ollama models.
-- **Key Features:**  
-  - **Model Discovery:**  
-    Asynchronously fetches available models from the Ollama API with retry logic.
-  - **Concurrent Execution:**  
-    Runs prompts against multiple models simultaneously using `asyncio.gather`.
-  - **Response Analysis:**  
-    - Tracks response times, token counts, and code execution results.
-    - Provides detailed analysis and comparison of model outputs.
-    - Generates formatted reports for easy comparison.
-  - **Error Handling:**  
-    Robust error handling for API failures, timeouts, and code execution issues.
-  - **Database Integration:**  
-    Stores comparison results for future reference and analysis.
-
-### 6. `agent/llm_client.py`
+### 5. `agent/llm_client.py`
 - **Purpose:**  
   Implements an asynchronous client to interact with the LLM API.
 - **Key Features:**  
   - **Asynchronous API Requests:**  
-    Uses `aiohttp` to send non‑blocking HTTP POST requests to the LLM_API_URL.
-  - **Payload Construction and Caching:**  
-    Builds a JSON payload containing the model name, conversation messages, and a streaming flag.  
-    Returns cached responses (from the in‑memory `_llm_cache`) when available.
-  - **Retry Mechanism:**  
-    Employs exponential backoff, retrying failed requests up to a configurable maximum number of attempts.
-  - **Response Handling:**  
-    Processes both streaming and standard responses by decoding JSON and returning either the `"response"` or message content.
-  - **Note:**  
-    This module uses a unified approach to send LLM requests instead of branching based on a Gemini/Gemeni condition.
+    Utilizes `aiohttp` for non‑blocking HTTP POST requests.
+  - **Payload Construction:**  
+    Constructs a JSON payload with model, messages, and parameters.
+  - **Improved Timeout Management:**
+    - Configurable timeout handling with support for disabling timeouts entirely.
+    - Proper error handling for timeouts and network issues.
+  - **Performance Metrics:**
+    - Tracks response times and token usage.
+    - Reports generation efficiency statistics.
 
-### 7. `agent/agent.py`
+### 6. `agent/agent.py`
 - **Purpose:**  
-  Houses the core logic of the AI agent, orchestrating conversation management, LLM interactions, and code execution.
+  Houses the core logic of the AI agent, integrating conversation management, LLM invocation, and code execution.
 - **Key Features:**  
-  - **MinimalAIAgent Class:**  
-    - Maintains conversation state, caches recent queries, and interfaces with the SQLite database.
-    - Builds a comprehensive context for LLM requests by combining the system prompt, past successful interactions (if similarity exceeds a threshold), and the current user query.
-    - Uses the `get_llm_response_async` function to retrieve responses from the LLM API.
-    - Extracts code blocks from responses and processes them concurrently with a semaphore-controlled auto‑fix loop.
-  - **User Interaction Flow:**  
-    - Listens for user input with options to exit or launch various commands.
-    - Reuses high-similarity cached responses to bypass unnecessary LLM calls.
-    - Stores all interactions and successful exchanges in the database.
-  - **Model Comparison:**
-    - Implements the `/compare` command for comparing model responses.
-    - Supports comparing the last query or a new prompt.
-    - Displays detailed analysis of model performance and outputs.
+  - **`MinimalAIAgent` Class:**  
+    Maintains the conversation state and initializes the SQLite database interface.
+  - **Web Search Integration:**  
+    Allows searching the web for real-time information using `/search` or `/web` commands.
+    - **Multi-Source Search**: Combines results from DuckDuckGo and Wikipedia for comprehensive coverage
+    - **Smart Result Ranking**: Intelligently ranks results based on relevance, source credibility, and query matching
+    - **Result Caching**: Implements a TTL-based cache for instant response to repeated queries
+    - **Search Shortcuts**: Provides convenient shortcuts with `?query` and ultra-fast `?!query` turbo mode
+    - **Background Prefetching**: Preloads top result content for faster subsequent interactions
+  - **Conversation History Management:**  
+    - `/history` command to view, search, clear, and save conversation history.
+    - Robust handling of conversation data with proper formatting.
+  - **Command Autocompletion:**  
+    - Tab completion for agent commands and shell commands.
+    - Context-aware completion for subcommands.
+  - **Model Switching:**  
+    Ability to change LLM models at runtime with the `/model` command.
+  - **Performance Monitoring:**  
+    - Tracks and displays detailed performance metrics.
+    - Shows Ollama configuration and optimization settings.
+  - **Improved Help System:**  
+    - Context-sensitive help with `/help [command]`.
+    - Detailed documentation for all features and commands.
+  - **Performance Optimization:**
+    - `/threads` command to view and adjust CPU thread count for Ollama.
+    - `/gpu` command to view and adjust GPU acceleration layers.
+    - Auto-detection of optimal CPU threads and GPU layers based on hardware.
+    - Persistent performance settings stored in the database.
+    - Dynamic configuration without requiring restart.
+  - **Building Context and LLM Invocation:**  
+    - Combines system prompt, conversation history, and user query.
+    - Uses `get_llm_response_async` for fetching responses.
+    - Handles code extraction and execution.
+  - **Auto‑Fix and Retry Mechanism:**  
+    Automatically requests revised code on execution failures.
 
-### 8. `agent/main.py`
+### 7. `agent/main.py`
 - **Purpose:**  
-  Serves as the entry point for running the AI agent.
-- **Key Functionality:**  
-  - Instantiates the `MinimalAIAgent` using the default settings from `agent/config.py`.
-  - Launches the asynchronous event loop with `asyncio.run()`, beginning the interactive session.
+  Acts as the entry point for launching the AI agent.
+- **Key Features:**  
+  - **Command Line Arguments:**  
+    - Allows configuration via command line options for model, performance settings, and more.
+    - Uses argparse for robust argument handling.
+  - **Initialization:**  
+    Creates and configures the `MinimalAIAgent` with provided settings.
+  - **Event Loop Management:**  
+    Starts the asynchronous event loop for the agent.
 
-## Summary
+### 8. `agent/model_comparator.py`
+- **Purpose:**  
+  Provides utilities for comparing different LLM models' performance.
+- **Key Features:**  
+  - **Model Benchmarking:**  
+    - Runs the same prompt on multiple models.
+    - Measures response times, token counts, and code execution results.
+  - **Performance Analysis:**  
+    Calculates efficiency metrics like tokens per second.
+  - **Result Storage:**  
+    Saves comparison results to the database for later analysis.
 
-- **Modularity and Asynchronous Design:**  
-  The project is divided into clear modules—each handling configuration, prompt management, persistent storage, LLM interaction, and code execution. Asynchronous patterns ensure responsiveness, particularly on CPU-only machines.
-  
-- **Robust Error Handling and Optimization:**  
-  From file I/O to network calls and code execution, every module has built-in error handling and logging. The caching of responses and use of exponential backoff in LLM requests optimize performance.
-  
-- **Flexible and Unified LLM Interaction:**  
-  The LLM client now sends requests to a single configurable endpoint (LLM_API_URL) with support for streaming and non-streaming responses, and no longer branches for Gemini-specific logic. The default model "deepseek-coder-v2" can be changed in `config.py`, offering flexibility in integrating with different LLM backends.
+## Summary of New Features
+
+The updated MacBot AI agent includes the following enhancements:
+
+1. **Command Line Configuration:**  
+   - Command line arguments for model selection and performance tuning.
+   - Runtime model switching with the `/model` command.
+
+2. **Web Integration:**  
+   - Advanced web search capabilities with multiple sources (DuckDuckGo, Wikipedia)
+   - Intelligent result ranking and caching for lightning-fast responses
+   - Convenient search shortcuts: `?query` for quick searches and `?!query` for ultra-fast turbo mode
+   - Background prefetching of top result content for improved performance
+
+3. **Conversation Management:**  
+   - `/history` command with view, search, clear, and save options.
+   - Robust conversation database with search capabilities.
+
+4. **Performance Optimization:**  
+   - Enhanced timeout handling including the `/notimeout` command.
+   - Temporary file usage when `SAVE_CODE_BLOCKS` is False.
+   - Performance metrics and diagnostics via the `/perf` command.
+
+5. **Improved User Experience:**  
+   - Command autocompletion for agent and shell commands.
+   - Context-sensitive help system with detailed documentation.
+   - Tab completion for faster command entry.
+   - Clean code execution output with clear separation between code and results.
+   - Consistent formatting of all UI elements.
+
+6. **Better Error Handling:**  
+   - More robust recovery from timeouts and errors.
+   - Clear error messages and user feedback.
+
+These enhancements make the MacBot AI agent more versatile, responsive, and user-friendly while maintaining its focus on running efficiently on CPU-only Macs.
 
 This document is kept up to date with the latest code base changes and provides a clear guide to the architecture and design decisions behind the MacBot AI agent.
